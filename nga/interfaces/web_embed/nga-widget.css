@@ -1,0 +1,89 @@
+/* NextGen-Anything (`nga`) Embeddable Website Widget Stylesheet */
+:root {
+  --nga-bg: #161b22;
+  --nga-surface: #0d1117;
+  --nga-border: #30363d;
+  --nga-text: #e6edf3;
+  --nga-muted: #8b949e;
+  --nga-primary: #2f81f7;
+  --nga-primary-hover: #388bfd;
+  --nga-radius: 10px;
+}
+
+.nga-embed-box {
+  background: var(--nga-bg);
+  color: var(--nga-text);
+  border: 1px solid var(--nga-border);
+  border-radius: var(--nga-radius);
+  padding: 16px;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  max-width: 720px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.nga-embed-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+
+.nga-embed-textarea {
+  width: 100%;
+  min-height: 76px;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid var(--nga-border);
+  background: var(--nga-surface);
+  color: var(--nga-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.82rem;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+.nga-embed-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.nga-embed-btn {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--nga-border);
+  background: var(--nga-surface);
+  color: var(--nga-text);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.nga-embed-btn--primary {
+  background: var(--nga-primary);
+  border-color: var(--nga-primary);
+  color: #ffffff;
+}
+
+.nga-embed-btn--primary:hover {
+  background: var(--nga-primary-hover);
+}
+
+.nga-embed-output {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--nga-border);
+  background: var(--nga-surface);
+  color: var(--nga-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.78rem;
+  overflow-x: auto;
+  max-height: 240px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  }

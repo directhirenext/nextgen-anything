@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
 from nga.core.contracts import ErrorCode, NgaError, ToolResponse, utc_now_iso
+from nga.core.security import redact_secrets
 from nga.core.workspace import NgaWorkspace
 
 
@@ -24,57 +26,84 @@ class DagNode:
 
 
 class WorkflowOrchestrator:
-    """Builds and executes dependency-ordered DAG plans across `nga` modules."""
+    """Builds and executes dependency-ordered DAG plans across `nga` modules with real data passing."""
 
     def __init__(self, workspace: NgaWorkspace | None = None) -> None:
         self.workspace = workspace if workspace is not None else NgaWorkspace()
 
-    def build_default_plan(self, target: str, target_type: str = "auto") -> list[DagNode]:
-        """Create a deterministic 4-stage DAG plan for a given target."""
-        clean_target = str(target).strip()
+    def build_default_plan(self, target: str, target_type: str = "auto") -> list[DagNode] | NgaError:
+        """Create a deterministic 4-stage DAG plan for a given non-empty target."""
+        clean_target = redact_secrets(str(target or "")).strip()
+        if not clean_target:
+            return NgaError(
+                error_code=ErrorCode.INVALID_INPUT.value,
+                module="nga.builder.orchestrator",
+                message="DAG plan target cannot be empty.",
+                recoverable=True,
+                suggested_fix="Provide a non-empty target path, URL, or label.",
+            )
+
+        clean_type = str(target_type or "auto").strip() or "auto"
         return [
             DagNode(
                 node_id="n1_inspect",
                 title="Inspect Target Structure & Contracts",
                 action="inspect",
                 depends_on=[],
-                params={"target": clean_target, "target_type": target_type},
+                params={"target": clean_target, "target_type": clean_type},
             ),
             DagNode(
                 node_id="n2_ledger",
                 title="Populate Reconstruction Obligation Ledger",
                 action="ledger_sync",
                 depends_on=["n1_inspect"],
-                params={},
+                params={"target": clean_target, "target_type": clean_type},
             ),
             DagNode(
                 node_id="n3_brief",
                 title="Generate Clean-Room Architecture Brief",
                 action="brief",
                 depends_on=["n2_ledger"],
-                params={},
+                params={"target": clean_target, "target_type": clean_type},
             ),
             DagNode(
                 node_id="n4_simulate_verify",
                 title="Simulate & Verify Ready State in Sandbox",
                 action="simulate_check",
                 depends_on=["n3_brief"],
-                params={},
+                params={"target": clean_target, "target_type": clean_type},
             ),
         ]
 
     @staticmethod
     def topological_sort(nodes: list[DagNode]) -> list[DagNode] | NgaError:
         """Order DAG nodes respecting dependencies and detect cycles."""
-        by_id: dict[str, DagNode] = {n.node_id: n for n in nodes}
-        if len(by_id) != len(nodes):
+        if not isinstance(nodes, list) or not nodes:
             return NgaError(
                 error_code=ErrorCode.INVALID_INPUT.value,
                 module="nga.builder.orchestrator",
-                message="Duplicate node_id found in DAG plan.",
+                message="DAG plan must contain at least one DagNode.",
                 recoverable=True,
-                suggested_fix="Ensure every DagNode has a unique node_id.",
             )
+
+        by_id: dict[str, DagNode] = {}
+        for n in nodes:
+            if not isinstance(n, DagNode) or not str(n.node_id).strip():
+                return NgaError(
+                    error_code=ErrorCode.INVALID_INPUT.value,
+                    module="nga.builder.orchestrator",
+                    message="Every DAG entry must be a DagNode with a non-empty node_id.",
+                    recoverable=True,
+                )
+            if n.node_id in by_id:
+                return NgaError(
+                    error_code=ErrorCode.INVALID_INPUT.value,
+                    module="nga.builder.orchestrator",
+                    message=f"Duplicate node_id found in DAG plan: '{n.node_id}'.",
+                    recoverable=True,
+                    suggested_fix="Ensure every DagNode has a unique node_id.",
+                )
+            by_id[n.node_id] = n
 
         visited: set[str] = set()
         visiting: set[str] = set()
@@ -118,18 +147,20 @@ class WorkflowOrchestrator:
         return ordered
 
     def run_plan(self, nodes: list[DagNode], runner_map: dict[str, Any] | None = None) -> ToolResponse | NgaError:
-        """Execute DAG nodes in topological order using provided action callables."""
+        """Execute DAG nodes in topological order, passing dependency outputs to downstream nodes."""
         ordered = self.topological_sort(nodes)
         if isinstance(ordered, NgaError):
             return ordered
 
-        handlers = runner_map or {}
+        handlers = runner_map if isinstance(runner_map, dict) else {}
         completed_ids: set[str] = set()
+        node_outputs: dict[str, dict[str, Any]] = {}
         execution_log: list[dict[str, Any]] = []
+        working_nodes = [deepcopy(n) for n in ordered]
 
-        self.workspace.log_journal("orchestrator", f"Starting DAG plan with {len(ordered)} node(s).")
+        self.workspace.log_journal("orchestrator", f"Starting DAG plan with {len(working_nodes)} node(s).")
 
-        for node in ordered:
+        for node in working_nodes:
             unmet = [d for d in node.depends_on if d not in completed_ids]
             if unmet:
                 node.status = "skipped"
@@ -137,6 +168,7 @@ class WorkflowOrchestrator:
                 execution_log.append(
                     {
                         "node_id": node.node_id,
+                        "action": node.action,
                         "status": node.status,
                         "error": node.error,
                     }
@@ -145,21 +177,44 @@ class WorkflowOrchestrator:
 
             fn = handlers.get(node.action)
             if not callable(fn):
-                node.status = "completed_dry"
-                node.output = {"note": f"No handler bound for action '{node.action}'; recorded as planned."}
-                completed_ids.add(node.node_id)
+                missing_err = NgaError(
+                    error_code=ErrorCode.TOOL_UNAVAILABLE.value,
+                    module="nga.builder.orchestrator",
+                    message=f"No executable handler bound for DAG action '{node.action}' at node '{node.node_id}'.",
+                    recoverable=True,
+                    suggested_fix=f"Provide a callable handler for action '{node.action}' in runner_map.",
+                )
+                node.status = "failed"
+                node.error = missing_err.to_dict()
+                self.workspace.merkle.append(
+                    "DAG_NODE_FAILED",
+                    {"node_id": node.node_id, "action": node.action, "error_code": missing_err.error_code},
+                )
                 execution_log.append(
                     {
                         "node_id": node.node_id,
                         "action": node.action,
                         "status": node.status,
-                        "timestamp": utc_now_iso(),
+                        "error": node.error,
                     }
                 )
-                continue
+                return NgaError(
+                    error_code=missing_err.error_code,
+                    module="nga.builder.orchestrator",
+                    message=missing_err.message,
+                    recoverable=True,
+                    suggested_fix=missing_err.suggested_fix,
+                    details={"completed_nodes": sorted(completed_ids), "log": execution_log},
+                )
+
+            enriched_params = dict(node.params or {})
+            dep_payloads = {dep: node_outputs[dep] for dep in node.depends_on if dep in node_outputs}
+            if dep_payloads:
+                enriched_params["dependency_outputs"] = dep_payloads
+                enriched_params["previous_output"] = node_outputs[node.depends_on[-1]]
 
             try:
-                res = fn(node.params)
+                res = fn(enriched_params)
                 if isinstance(res, NgaError):
                     node.status = "failed"
                     node.error = res.to_dict()
@@ -184,8 +239,10 @@ class WorkflowOrchestrator:
                         details={"completed_nodes": sorted(completed_ids), "log": execution_log},
                     )
 
+                serialized_out = res.to_dict() if hasattr(res, "to_dict") else (res if isinstance(res, dict) else {"result": res})
                 node.status = "completed"
-                node.output = res.to_dict() if hasattr(res, "to_dict") else {"result": res}
+                node.output = serialized_out
+                node_outputs[node.node_id] = serialized_out
                 completed_ids.add(node.node_id)
                 execution_log.append(
                     {
@@ -196,12 +253,17 @@ class WorkflowOrchestrator:
                     }
                 )
             except Exception as exc:
+                safe_exc = redact_secrets(str(exc))
                 node.status = "failed"
-                node.error = {"exception": str(exc)}
+                node.error = {"exception": safe_exc}
+                self.workspace.merkle.append(
+                    "DAG_NODE_FAILED",
+                    {"node_id": node.node_id, "error_code": ErrorCode.INTERNAL_ERROR.value},
+                )
                 return NgaError(
                     error_code=ErrorCode.INTERNAL_ERROR.value,
                     module="nga.builder.orchestrator",
-                    message=f"Unhandled error in DAG node '{node.node_id}': {exc}",
+                    message=f"Unhandled error in DAG node '{node.node_id}': {safe_exc}",
                     recoverable=True,
                     suggested_fix="Inspect node parameters and handler implementation.",
                     details={"log": execution_log},
@@ -209,16 +271,17 @@ class WorkflowOrchestrator:
 
         self.workspace.merkle.append(
             "DAG_PLAN_COMPLETED",
-            {"completed_count": len(completed_ids), "total_nodes": len(ordered)},
+            {"completed_count": len(completed_ids), "total_nodes": len(working_nodes)},
         )
 
         return ToolResponse(
             module="nga.builder.orchestrator",
-            summary=f"DAG plan finished: {len(completed_ids)}/{len(ordered)} node(s) completed.",
+            summary=f"DAG plan finished: {len(completed_ids)}/{len(working_nodes)} node(s) completed.",
             data={
                 "completed_nodes": sorted(completed_ids),
-                "total_nodes": len(ordered),
+                "total_nodes": len(working_nodes),
+                "node_outputs": node_outputs,
                 "execution_log": execution_log,
             },
-  )
-                             
+        )
+        

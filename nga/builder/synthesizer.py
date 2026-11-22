@@ -678,7 +678,7 @@ _FRONTEND_HTML_TEMPLATE = """<!doctype html>
         delBtn.className = "danger";
         delBtn.textContent = "Delete #" + item.id;
         delBtn.onclick = async () => {
-          const res = await fetch(path.replace(/\/$/, "") + "/" + item.id, { method: "DELETE" });
+          const res = await fetch(path.replace(/\\/$/, "") + "/" + item.id, { method: "DELETE" });
           out.textContent = JSON.stringify(await res.json(), null, 2);
           await loadRecords();
         };
@@ -721,7 +721,7 @@ _FRONTEND_HTML_TEMPLATE = """<!doctype html>
       try {
         const path = routeSelect.value;
         const body = collectPayload();
-        const res = await fetch(path.replace(/\/$/, "") + "/" + id, {
+        const res = await fetch(path.replace(/\\/$/, "") + "/" + id, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -740,7 +740,7 @@ _FRONTEND_HTML_TEMPLATE = """<!doctype html>
         return;
       }
       const path = routeSelect.value;
-      const res = await fetch(path.replace(/\/$/, "") + "/" + id, { method: "DELETE" });
+      const res = await fetch(path.replace(/\\/$/, "") + "/" + id, { method: "DELETE" });
       out.textContent = JSON.stringify(await res.json(), null, 2);
       await loadRecords();
     }
@@ -758,6 +758,7 @@ _FRONTEND_HTML_TEMPLATE = """<!doctype html>
 </body>
 </html>
 """
+
 
 _TESTS_PY_TEMPLATE = '''"""Automated SQLite CRUD verification tests for the reconstructed application."""
 
@@ -830,6 +831,8 @@ def _build_sandbox_smoke_script(server_code: str, route_specs: list[dict[str, An
     first_route = route_specs[0]
     stripped_lines: list[str] = []
     for line in server_code.splitlines():
+        if line.strip().startswith('if __name__ == "__main__":'):
+            break
         if line.startswith(("from __future__", "from pathlib", "BASE_DIR =", "PUBLIC_DIR =", "DEFAULT_DB_PATH =")):
             continue
         stripped_lines.append(line)
@@ -994,3 +997,4 @@ class AutonomousProjectSynthesizer:
                 "manifest": manifest_payload,
             },
     )
+                               

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import re
 from typing import Any, Callable
 
 from nga.core.contracts import (
@@ -16,6 +18,38 @@ from nga.core.contracts import (
 from nga.core.ledger import ObligationLedger
 from nga.core.workspace import NgaWorkspace
 from nga.runtime.simulator import SimulationGate
+
+_SANDBOX_FILE_RE = re.compile(r'File\s+"[^"]+",\s+line\s+\d+', re.IGNORECASE)
+_TEMP_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:)?(?:[/\\][^\s\"':,)]*sbx_[a-f0-9]+[^\s\"':,)]*|/tmp/[^\s\"':,)]+)",
+    re.IGNORECASE,
+)
+_RUN_ID_RE = re.compile(r"\bsbx_[a-f0-9]{6,}\b", re.IGNORECASE)
+_HEX_ADDR_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
+
+
+def _normalize_sandbox_text(text: str) -> str:
+    """Strip per-run temp paths, sandbox IDs, and memory addresses for stable error matching."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = _SANDBOX_FILE_RE.sub('File "<sandbox>", line N', cleaned)
+    cleaned = _TEMP_PATH_RE.sub("<sandbox_path>", cleaned)
+    cleaned = _RUN_ID_RE.sub("<sbx_id>", cleaned)
+    cleaned = _HEX_ADDR_RE.sub("<addr>", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _compute_stall_signature(report: SimulationReport, label: str, attempt: int) -> str:
+    """Compute a deterministic failure signature invariant to temp directory names."""
+    norm_stderr = _normalize_sandbox_text(report.stderr_preview)
+    norm_checks = "|".join(_normalize_sandbox_text(c) for c in (report.checks_failed or []))
+    if norm_stderr or norm_checks:
+        basis = f"{report.status.value}|{norm_checks}|{norm_stderr}"
+        return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+    if report.error_signature:
+        return str(report.error_signature)
+    return f"FAIL:{label}:{attempt}"
 
 
 @dataclass
@@ -82,13 +116,14 @@ class ParityVerificationLoop:
                 if isinstance(report, NgaError):
                     return report
 
+                sig = _compute_stall_signature(report, label, attempt)
                 record = {
                     "iteration": idx,
                     "attempt": attempt,
                     "label": label,
                     "status": report.status.value,
                     "passed": report.passed,
-                    "error_signature": report.error_signature,
+                    "error_signature": sig,
                     "duration_ms": report.duration_ms,
                     "checks_passed": report.checks_passed,
                     "checks_failed": report.checks_failed,
@@ -128,8 +163,6 @@ class ParityVerificationLoop:
                         },
                     )
 
-                # Handle failure & stall tracking
-                sig = report.error_signature or f"FAIL:{label}:{attempt}"
                 if sig == last_error_sig:
                     consecutive_same_errors += 1
                 else:
@@ -166,7 +199,7 @@ class ParityVerificationLoop:
                         },
                     )
 
-                if callable(repair_fn) and attempt < 3:
+                if callable(repair_fn) and attempt < max(3, stall_limit):
                     repaired = repair_fn(current_code, report, attempt)
                     if isinstance(repaired, str) and repaired.strip():
                         current_code = repaired
@@ -184,5 +217,5 @@ class ParityVerificationLoop:
                 "last_attempt": last_sim,
                 "history": history,
             },
-      )
-                  
+)
+    

@@ -48,6 +48,9 @@ class ErrorCode(str, Enum):
     TOOL_UNAVAILABLE = "NGA_TOOL_UNAVAILABLE"
     PLUGIN_ERROR = "NGA_PLUGIN_ERROR"
     STORAGE_ERROR = "NGA_STORAGE_ERROR"
+    EXECUTION_FAILED = "NGA_EXECUTION_FAILED"
+    NETWORK_ERROR = "NGA_NETWORK_ERROR"
+    AUTH_ERROR = "NGA_AUTH_ERROR"
     INTERNAL_ERROR = "NGA_INTERNAL_ERROR"
 
 
@@ -62,6 +65,11 @@ class NgaError:
     suggested_fix: str = "Verify inputs, permissions, or target path and retry."
     timestamp: str = field(default_factory=utc_now_iso)
     details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        """Always False for error responses."""
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize error as dictionary."""
@@ -83,7 +91,7 @@ class NgaError:
 
 @dataclass
 class ToolResponse:
-    """Standardized success response with pagination and optional simulation state."""
+    """Standardized response contract with pagination, status flag, and optional simulation state."""
 
     module: str
     data: dict[str, Any]
@@ -91,12 +99,13 @@ class ToolResponse:
     truncated: bool = False
     next_offset: int | None = None
     simulation_status: str | None = None
+    ok: bool = True
     timestamp: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert response to dictionary."""
         payload: dict[str, Any] = {
-            "ok": True,
+            "ok": bool(self.ok),
             "module": self.module,
             "summary": self.summary,
             "truncated": self.truncated,
@@ -162,7 +171,7 @@ class LedgerObligation:
 
 
 class HandleRegistry:
-    """Maps string keys to compact integer handles (#1, #2, ...) to keep outputs concise."""
+    """Maps string keys to stable integer handles (#1, #2, ...) to keep outputs concise."""
 
     def __init__(self) -> None:
         self._key_to_handle: dict[str, int] = {}
@@ -176,24 +185,50 @@ class HandleRegistry:
         if not clean_key:
             raise ValueError("Handle key cannot be empty.")
         if clean_key in self._key_to_handle:
-            handle = self._id_to_handle_lookup(clean_key)
+            handle = self._key_to_handle[clean_key]
             if metadata:
                 self._handle_to_meta[handle].update(metadata)
             return handle
 
         self._counter += 1
+        while self._counter in self._handle_to_key:
+            self._counter += 1
         handle = self._counter
         self._key_to_handle[clean_key] = handle
         self._handle_to_key[handle] = clean_key
         self._handle_to_meta[handle] = dict(metadata) if metadata else {}
         return handle
 
-    def _id_to_handle_lookup(self, clean_key: str) -> int:
-        return self._key_to_handle[clean_key]
+    def register_with_handle(
+        self,
+        handle: int,
+        key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        """Restore a key with its exact previously assigned handle ID when unused."""
+        clean_key = str(key).strip()
+        if not clean_key:
+            raise ValueError("Handle key cannot be empty.")
+        if clean_key in self._key_to_handle:
+            existing = self._key_to_handle[clean_key]
+            if metadata:
+                self._handle_to_meta[existing].update(metadata)
+            return existing
+        if isinstance(handle, int) and handle > 0 and handle not in self._handle_to_key:
+            self._key_to_handle[clean_key] = handle
+            self._handle_to_key[handle] = clean_key
+            self._handle_to_meta[handle] = dict(metadata) if metadata else {}
+            if handle > self._counter:
+                self._counter = handle
+            return handle
+        return self.register(clean_key, metadata)
 
     def resolve_key(self, handle: int) -> str | None:
         """Resolve integer handle to original key."""
-        return self._handle_to_key.get(int(handle))
+        try:
+            return self._handle_to_key.get(int(handle))
+        except (TypeError, ValueError):
+            return None
 
     def resolve_handle(self, key: str) -> int | None:
         """Resolve key to integer handle."""
@@ -201,7 +236,10 @@ class HandleRegistry:
 
     def get_meta(self, handle: int) -> dict[str, Any] | None:
         """Get metadata stored for a handle."""
-        return self._handle_to_meta.get(int(handle))
+        try:
+            return self._handle_to_meta.get(int(handle))
+        except (TypeError, ValueError):
+            return None
 
     def list_all(self) -> list[dict[str, Any]]:
         """List all handle entries ordered by handle ID."""
@@ -223,7 +261,7 @@ class HandleRegistry:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> HandleRegistry:
-        """Deserialize registry state safely."""
+        """Deserialize registry state while preserving original handle IDs."""
         reg = cls()
         if not isinstance(payload, dict):
             return reg
@@ -234,10 +272,15 @@ class HandleRegistry:
                     continue
                 key = str(entry.get("key", "")).strip()
                 meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else {}
-                if key:
+                raw_handle = entry.get("handle")
+                if not key:
+                    continue
+                if isinstance(raw_handle, int) and raw_handle > 0:
+                    reg.register_with_handle(raw_handle, key, meta)
+                else:
                     reg.register(key, meta)
         counter = payload.get("counter")
-        if isinstance(counter, int) and counter >= reg._counter:
+        if isinstance(counter, int) and counter > reg._counter:
             reg._counter = counter
         return reg
-      
+    

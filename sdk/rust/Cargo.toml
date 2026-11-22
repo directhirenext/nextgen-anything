@@ -1,0 +1,8 @@
+[package]
+name = "nga-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Rust client SDK for NextGen-Anything (nga)"
+license = "Apache-2.0"
+
+[dependencies]

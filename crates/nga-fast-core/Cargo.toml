@@ -1,0 +1,8 @@
+[package]
+name = "nga-fast-core"
+version = "0.1.0"
+edition = "2021"
+description = "Optional high-speed Rust scanner and indexer utilities for NextGen-Anything (nga)"
+license = "Apache-2.0"
+
+[dependencies]

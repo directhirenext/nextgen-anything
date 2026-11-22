@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any
+from urllib.parse import urlparse
 
 from nga.aaire.intent_agent import AutonomousIntentAgent
 from nga.aaire.memory_vault import AaireMemoryVault
@@ -46,6 +49,125 @@ def _emit_payload(payload: dict[str, Any], max_chars: int = DEFAULT_MAX_OUTPUT_C
         sys.stdout.write(raw + "\n")
 
 
+def _run_inspection(
+    kind: str,
+    target: str,
+    base_root: Path,
+    cache: NgaCache,
+    handles: Any,
+) -> ToolResponse | NgaError:
+    """Dispatch inspection to the matching analyzer module."""
+    if kind == "web":
+        return inspect_local_web_target(target, base_root=base_root, cache=cache, handles=handles)
+    if kind == "har":
+        return inspect_local_har(target, base_root=base_root, cache=cache, handles=handles)
+    if kind == "archive":
+        return inspect_archive_package(target, base_root=base_root, cache=cache, handles=handles)
+    return inspect_binary_target(target, base_root=base_root, cache=cache, handles=handles)
+
+
+def _extract_mock_routes(findings: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build normalized mock route entries from HAR inspection data."""
+    routes: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for raw in findings.get("mock_routes") or []:
+        if not isinstance(raw, dict):
+            continue
+        method = str(raw.get("method", "GET")).upper().strip() or "GET"
+        path = str(raw.get("path", "/")).strip() or "/"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        key = (method, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        body = raw.get("parsed_json")
+        if body is None:
+            body = {"ok": True, "method": method, "path": path, "mock": True}
+        routes.append({"method": method, "path": path, "status": int(raw.get("status", 200) or 200), "body": body})
+
+    for ep in findings.get("endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        method = str(ep.get("method", "GET")).upper().strip() or "GET"
+        path = str(ep.get("path", "/")).strip() or "/"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        key = (method, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        routes.append(
+            {
+                "method": method,
+                "path": path,
+                "status": int(ep.get("status", 200) or 200),
+                "body": {"ok": True, "method": method, "path": path, "schema": ep.get("schema")},
+            }
+        )
+
+    return routes
+
+
+def _serve_mock_http(host: str, port: int, routes: list[dict[str, Any]]) -> int:
+    """Serve discovered HAR routes over a local threaded HTTP server."""
+    route_map: dict[tuple[str, str], tuple[int, Any]] = {
+        (r["method"], r["path"]): (int(r["status"]), r["body"]) for r in routes
+    }
+
+    class _MockHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def _send_json(self, status: int, payload: Any) -> None:
+            encoded = json.dumps(payload, indent=2, default=str).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def _handle(self, method: str) -> None:
+            req_path = urlparse(self.path).path or "/"
+            if method == "GET" and req_path == "/__health":
+                self._send_json(200, {"ok": True, "mode": "har_mock", "routes_count": len(route_map)})
+                return
+            hit = route_map.get((method, req_path))
+            if hit is not None:
+                self._send_json(hit[0], hit[1])
+                return
+            self._send_json(404, {"ok": False, "error": "Not Found", "method": method, "path": req_path})
+
+        def do_GET(self) -> None:
+            self._handle("GET")
+
+        def do_POST(self) -> None:
+            self._handle("POST")
+
+        def do_PUT(self) -> None:
+            self._handle("PUT")
+
+        def do_PATCH(self) -> None:
+            self._handle("PATCH")
+
+        def do_DELETE(self) -> None:
+            self._handle("DELETE")
+
+    httpd = ThreadingHTTPServer((host, port), _MockHandler)
+    sys.stdout.write(
+        json.dumps({"ok": True, "listening": f"http://{host}:{port}", "routes_count": len(route_map)}) + "\n"
+    )
+    sys.stdout.flush()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the argument parser for `nga` CLI commands."""
     parser = argparse.ArgumentParser(
@@ -65,6 +187,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect.add_argument("kind", choices=["web", "har", "archive", "binary"], help="Target category.")
     p_inspect.add_argument("target", help="Target path relative to --root.")
 
+    p_rebuild = sub.add_parser(
+        "rebuild",
+        help="One-command inspect + SQLite CRUD synthesis + sandbox verification + ledger sync.",
+    )
+    p_rebuild.add_argument("kind", choices=["web", "har", "archive", "binary"], help="Target category.")
+    p_rebuild.add_argument("target", help="Target path relative to --root.")
+    p_rebuild.add_argument("--name", default="", help="Optional application name.")
+    p_rebuild.add_argument("--out", default="rebuilt_app", help="Output directory relative to --root.")
+
+    p_mock = sub.add_parser("mock", help="Start a local HTTP mock server from a captured HAR file.")
+    p_mock.add_argument("target", help="HAR file path relative to --root.")
+    p_mock.add_argument("--host", default="127.0.0.1", help="Bind host.")
+    p_mock.add_argument("--port", type=int, default=8090, help="Bind port.")
+    p_mock.add_argument("--dry-run", action="store_true", help="Parse and print mock routes without binding a port.")
+
     p_sim = sub.add_parser("simulate", help="Run Python code inside the isolated sandbox simulation gate.")
     p_sim.add_argument("code", help="Python code snippet to simulate.")
     p_sim.add_argument("--smoke", default="", help="Optional smoke-test assertions code.")
@@ -80,8 +217,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument("--code", default="", help="Optional Python candidate code.")
     p_agent.add_argument("--label", default="agent_cli", help="Target label.")
 
-    p_tg = sub.add_parser("telegram", help="Run a single non-blocking Telegram getUpdates poll cycle.")
-    p_tg.add_argument("--limit", type=int, default=10, help="Maximum updates to fetch.")
+    p_tg = sub.add_parser("telegram", help="Poll Telegram updates once or run continuously with --loop.")
+    p_tg.add_argument("--limit", type=int, default=10, help="Maximum updates per poll.")
+    p_tg.add_argument("--loop", action="store_true", help="Run continuous polling loop until interrupted.")
+    p_tg.add_argument("--interval", type=float, default=3.0, help="Seconds between poll cycles in --loop mode.")
+    p_tg.add_argument("--max-cycles", type=int, default=0, help="Stop after N cycles in --loop mode (0 = unlimited).")
+    p_tg.add_argument("--allowed-chat-id", action="append", default=[], help="Allowed Telegram chat ID (repeatable).")
 
     p_ledger = sub.add_parser("ledger", help="Manage reconstruction obligations.")
     p_ledger.add_argument("action", choices=["list", "add", "update"], help="Ledger action.")
@@ -138,14 +279,48 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         result = run_environment_doctor(workspace_root=ws.root)
     elif args.command == "inspect":
-        if args.kind == "web":
-            result = inspect_local_web_target(args.target, base_root=base_root, cache=cache, handles=handles)
-        elif args.kind == "har":
-            result = inspect_local_har(args.target, base_root=base_root, cache=cache, handles=handles)
-        elif args.kind == "archive":
-            result = inspect_archive_package(args.target, base_root=base_root, cache=cache, handles=handles)
+        result = _run_inspection(args.kind, args.target, base_root, cache, handles)
+    elif args.command == "rebuild":
+        inspected = _run_inspection(args.kind, args.target, base_root, cache, handles)
+        if isinstance(inspected, NgaError):
+            result = inspected
         else:
-            result = inspect_binary_target(args.target, base_root=base_root, cache=cache, handles=handles)
+            findings = inspected.data if isinstance(inspected.data, dict) else {}
+            app_name = args.name.strip() or Path(args.target).stem or "reconstructed_app"
+            synth = AutonomousProjectSynthesizer(simulator=simulator, workspace=ws, ledger=ledger)
+            synth_res = synth.synthesize_project(
+                app_name=app_name,
+                findings=findings,
+                output_dir=args.out,
+                base_root=base_root,
+            )
+            if isinstance(synth_res, NgaError):
+                result = synth_res
+            else:
+                result = ToolResponse(
+                    module="nga.interfaces.cli",
+                    summary=f"Rebuild complete: {inspected.summary} -> {synth_res.summary}",
+                    simulation_status=synth_res.simulation_status,
+                    data={
+                        "inspection_summary": inspected.summary,
+                        "synthesis": synth_res.data,
+                    },
+                )
+    elif args.command == "mock":
+        inspected = inspect_local_har(args.target, base_root=base_root, cache=cache, handles=handles)
+        if isinstance(inspected, NgaError):
+            result = inspected
+        else:
+            findings = inspected.data if isinstance(inspected.data, dict) else {}
+            routes = _extract_mock_routes(findings)
+            if args.dry_run:
+                result = ToolResponse(
+                    module="nga.interfaces.cli",
+                    summary=f"Loaded {len(routes)} mock route(s) from HAR (dry-run).",
+                    data={"routes_count": len(routes), "routes": routes},
+                )
+            else:
+                return _serve_mock_http(args.host, args.port, routes)
     elif args.command == "simulate":
         rep = simulator.simulate_crafted_python(
             code=args.code,
@@ -167,7 +342,6 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(parsed_findings, dict):
                 parsed_findings = {}
         except json.JSONDecodeError as exc:
-            parsed_findings = {}
             result = NgaError(
                 error_code=ErrorCode.INVALID_INPUT.value,
                 module="nga.interfaces.cli",
@@ -198,18 +372,43 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "telegram":
         bridge = TelegramBotBridge(
+            allowed_chat_ids=args.allowed_chat_id or None,
             agent=AutonomousIntentAgent(vault=vault, simulator=simulator, ledger=ledger, workspace=ws),
             simulator=simulator,
         )
-        polled = bridge.poll_once(limit=args.limit)
-        if isinstance(polled, NgaError):
-            result = polled
-        else:
+        if args.loop:
+            cycles = 0
+            total_updates = 0
+            sleep_sec = max(0.5, float(args.interval))
+            try:
+                while args.max_cycles <= 0 or cycles < args.max_cycles:
+                    cycles += 1
+                    polled = bridge.poll_once(limit=args.limit)
+                    if isinstance(polled, NgaError):
+                        _emit_payload(polled.to_dict(), max_chars=args.max_chars, offset=args.offset)
+                        return 1
+                    total_updates += len(polled)
+                    if polled:
+                        _emit_payload({"ok": True, "cycle": cycles, "updates": polled}, max_chars=args.max_chars)
+                    if args.max_cycles <= 0 or cycles < args.max_cycles:
+                        time.sleep(sleep_sec)
+            except KeyboardInterrupt:
+                pass
             result = ToolResponse(
                 module="nga.aaire.telegram_bridge",
-                summary=f"Processed {len(polled)} Telegram update(s).",
-                data={"updates": polled},
+                summary=f"Telegram polling stopped after {cycles} cycle(s), {total_updates} update(s).",
+                data={"cycles": cycles, "total_updates": total_updates},
             )
+        else:
+            polled = bridge.poll_once(limit=args.limit)
+            if isinstance(polled, NgaError):
+                result = polled
+            else:
+                result = ToolResponse(
+                    module="nga.aaire.telegram_bridge",
+                    summary=f"Processed {len(polled)} Telegram update(s).",
+                    data={"updates": polled},
+                )
     elif args.command == "ledger":
         if args.action == "list":
             listing = ledger.list_obligations()
@@ -268,4 +467,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-    

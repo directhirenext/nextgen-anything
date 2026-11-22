@@ -8,11 +8,12 @@ import sys
 from typing import Any
 
 from nga.aaire.intent_agent import AutonomousIntentAgent
+from nga.aaire.llm_engine import UniversalLlmEngine
 from nga.aaire.memory_vault import AaireMemoryVault
 from nga.analyzers.archive_pkg import inspect_archive_package
 from nga.analyzers.binary_meta import inspect_binary_target
 from nga.analyzers.network_har import inspect_local_har
-from nga.analyzers.web_js import inspect_local_web_target
+from nga.analyzers.web_js import inspect_live_web_url, inspect_local_web_target
 from nga.builder.brief_gen import generate_architecture_brief
 from nga.builder.synthesizer import AutonomousProjectSynthesizer
 from nga.core.cache import NgaCache
@@ -24,17 +25,17 @@ from nga.core.workspace import NgaWorkspace
 from nga.runtime.simulator import SimulationGate
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "nextgen-anything", "version": "0.1.0"}
+SERVER_INFO = {"name": "nextgen-anything", "version": "0.2.0"}
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "nga_doctor",
-        "description": "Inspect host OS, Python runtime, workspace health, and available CLI tools.",
+        "description": "Inspect host OS, Python runtime, SQLite/FTS5, workspace health, and available CLI tools.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "nga_inspect",
-        "description": "Inspect a local web/JS, HAR, archive, or binary target safely inside base_root.",
+        "description": "Inspect a local web/JS, HAR, archive/APK, or binary target safely inside base_root.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -42,6 +43,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "target": {"type": "string"},
             },
             "required": ["kind", "target"],
+        },
+    },
+    {
+        "name": "nga_live_inspect",
+        "description": "Fetch and inspect a live HTTP/HTTPS web URL safely with size and output budgets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+            },
+            "required": ["url"],
         },
     },
     {
@@ -59,20 +71,22 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "nga_synthesize",
-        "description": "Synthesize and sandbox-verify a multi-file SQLite CRUD project from structured findings.",
+        "description": "Synthesize and sandbox-verify a multi-file SQLite CRUD project from findings and custom features.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "app_name": {"type": "string", "default": "reconstructed_app"},
                 "findings": {"type": "object"},
                 "output_dir": {"type": "string", "default": "synthesized_out"},
+                "custom_prompt": {"type": "string", "default": ""},
+                "include_android_scaffold": {"type": "boolean", "default": False},
             },
             "required": ["findings"],
         },
     },
     {
         "name": "nga_rebuild",
-        "description": "One-command pipeline: inspect target -> synthesize SQLite CRUD app -> sandbox verify -> sync ledger.",
+        "description": "One-command pipeline: inspect target -> synthesize SQLite CRUD app (+ Android scaffold for APK) -> sandbox verify -> sync ledger.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -80,13 +94,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "target": {"type": "string"},
                 "app_name": {"type": "string", "default": ""},
                 "output_dir": {"type": "string", "default": "rebuilt_app"},
+                "custom_prompt": {"type": "string", "default": ""},
             },
             "required": ["kind", "target"],
         },
     },
     {
         "name": "nga_agent_turn",
-        "description": "Run an autonomous intent turn with memory vault recall, sandbox verification, and ledger sync.",
+        "description": "Run an autonomous AAIRE intent turn with memory vault recall, universal LLM (optional), and sandbox gate.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -162,12 +177,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "nga_brief",
-        "description": "Generate an architecture and technology blueprint for a target.",
+        "description": "Generate a deterministic clean-room architecture and technology blueprint for a target.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "label": {"type": "string"},
                 "kind": {"type": "string", "default": "web"},
+                "custom_requirements": {"type": "string", "default": ""},
             },
             "required": ["label"],
         },
@@ -202,6 +218,18 @@ def _run_target_inspection(
     return inspect_binary_target(target, base_root=base_root, cache=cache, handles=handles)
 
 
+def _flatten_inspection_findings(inspected: ToolResponse) -> dict[str, Any]:
+    """Merge top-level and nested analyzer payloads so synthesizer sees routes, forms, endpoints & APK metadata."""
+    base = dict(inspected.data) if isinstance(inspected.data, dict) else {}
+    for nested_key in ("analysis", "package", "metadata"):
+        nested = base.get(nested_key)
+        if isinstance(nested, dict):
+            for k, v in nested.items():
+                if k not in base or not base[k]:
+                    base[k] = v
+    return base
+
+
 class NgaMcpServer:
     """Stateful MCP JSON-RPC 2.0 dispatcher wired to all nga subsystems."""
 
@@ -210,25 +238,30 @@ class NgaMcpServer:
         project_name: str = "default",
         base_root: Path | str | None = None,
         max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+        workspace_base_dir: Path | str | None = None,
+        llm_engine: UniversalLlmEngine | None = None,
     ) -> None:
         self.base_root = Path(base_root).resolve() if base_root is not None else Path.cwd().resolve()
         self.max_output_chars = max(512, int(max_output_chars))
-        self.workspace = NgaWorkspace(project_name=project_name)
+        self.workspace = NgaWorkspace(project_name=project_name, base_dir=workspace_base_dir)
         self.cache = NgaCache(self.workspace.root / "cache.sqlite")
         self.handles = self.workspace.get_handles()
         self.ledger = ObligationLedger(self.workspace.root / "ledger.json", handles=self.handles)
         self.vault = AaireMemoryVault(self.workspace.root / "memory_vault.sqlite")
         self.simulator = SimulationGate()
+        self.llm = llm_engine if llm_engine is not None else UniversalLlmEngine()
         self.synthesizer = AutonomousProjectSynthesizer(
             simulator=self.simulator,
             workspace=self.workspace,
             ledger=self.ledger,
+            llm_engine=self.llm,
         )
         self.agent = AutonomousIntentAgent(
             vault=self.vault,
             simulator=self.simulator,
             ledger=self.ledger,
             workspace=self.workspace,
+            llm_engine=self.llm,
         )
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool]:
@@ -236,184 +269,213 @@ class NgaMcpServer:
         args = arguments if isinstance(arguments, dict) else {}
         outcome: ToolResponse | NgaError | dict[str, Any]
 
-        if tool_name == "nga_doctor":
-            outcome = run_environment_doctor(workspace_root=self.workspace.root)
-        elif tool_name == "nga_inspect":
-            kind = str(args.get("kind", "")).strip()
-            target = str(args.get("target", "")).strip()
-            if kind not in {"web", "har", "archive", "binary"} or not target:
-                outcome = NgaError(
-                    error_code=ErrorCode.INVALID_INPUT.value,
-                    module="nga.interfaces.mcp_server",
-                    message="nga_inspect requires valid 'kind' and non-empty 'target'.",
-                    recoverable=True,
-                )
-            else:
-                outcome = _run_target_inspection(kind, target, self.base_root, self.cache, self.handles)
-        elif tool_name == "nga_simulate":
-            rep = self.simulator.simulate_crafted_python(
-                code=str(args.get("code", "")),
-                smoke_assertions_code=str(args.get("smoke", "")),
-                target_label=str(args.get("label", "mcp_snippet")),
-            )
-            outcome = (
-                rep
-                if isinstance(rep, NgaError)
-                else ToolResponse(
-                    module="nga.runtime.simulator",
-                    summary=f"Simulation {rep.status.value} ({rep.duration_ms}ms).",
-                    simulation_status=rep.status.value,
-                    data={"simulation": rep.to_dict()},
-                )
-            )
-        elif tool_name == "nga_synthesize":
-            findings = args.get("findings")
-            if not isinstance(findings, dict):
-                outcome = NgaError(
-                    error_code=ErrorCode.INVALID_INPUT.value,
-                    module="nga.interfaces.mcp_server",
-                    message="nga_synthesize requires 'findings' JSON object.",
-                    recoverable=True,
-                )
-            else:
-                outcome = self.synthesizer.synthesize_project(
-                    app_name=str(args.get("app_name", "reconstructed_app")),
-                    findings=findings,
-                    output_dir=str(args.get("output_dir", "synthesized_out")),
-                    base_root=self.base_root,
-                )
-        elif tool_name == "nga_rebuild":
-            kind = str(args.get("kind", "")).strip()
-            target = str(args.get("target", "")).strip()
-            if kind not in {"web", "har", "archive", "binary"} or not target:
-                outcome = NgaError(
-                    error_code=ErrorCode.INVALID_INPUT.value,
-                    module="nga.interfaces.mcp_server",
-                    message="nga_rebuild requires valid 'kind' and non-empty 'target'.",
-                    recoverable=True,
-                )
-            else:
-                inspected = _run_target_inspection(kind, target, self.base_root, self.cache, self.handles)
-                if isinstance(inspected, NgaError):
-                    outcome = inspected
-                else:
-                    findings = inspected.data if isinstance(inspected.data, dict) else {}
-                    app_name = str(args.get("app_name", "")).strip() or Path(target).stem or "reconstructed_app"
-                    synth_res = self.synthesizer.synthesize_project(
-                        app_name=app_name,
-                        findings=findings,
-                        output_dir=str(args.get("output_dir", "rebuilt_app")),
-                        base_root=self.base_root,
+        try:
+            if tool_name == "nga_doctor":
+                outcome = run_environment_doctor(workspace_root=self.workspace.root)
+            elif tool_name == "nga_inspect":
+                kind = str(args.get("kind", "")).strip()
+                target = str(args.get("target", "")).strip()
+                if kind not in {"web", "har", "archive", "binary"} or not target:
+                    outcome = NgaError(
+                        error_code=ErrorCode.INVALID_INPUT.value,
+                        module="nga.interfaces.mcp_server",
+                        message="nga_inspect requires valid 'kind' and non-empty 'target'.",
+                        recoverable=True,
                     )
-                    if isinstance(synth_res, NgaError):
-                        outcome = synth_res
+                else:
+                    outcome = _run_target_inspection(kind, target, self.base_root, self.cache, self.handles)
+            elif tool_name == "nga_live_inspect":
+                url = str(args.get("url", "")).strip()
+                if not url:
+                    outcome = NgaError(
+                        error_code=ErrorCode.INVALID_INPUT.value,
+                        module="nga.interfaces.mcp_server",
+                        message="nga_live_inspect requires non-empty 'url'.",
+                        recoverable=True,
+                    )
+                else:
+                    outcome = inspect_live_web_url(url=url, cache=self.cache, handles=self.handles)
+            elif tool_name == "nga_simulate":
+                rep = self.simulator.simulate_crafted_python(
+                    code=str(args.get("code", "")),
+                    smoke_assertions_code=str(args.get("smoke", "")),
+                    target_label=str(args.get("label", "mcp_snippet")),
+                )
+                outcome = (
+                    rep
+                    if isinstance(rep, NgaError)
+                    else ToolResponse(
+                        module="nga.runtime.simulator",
+                        ok=rep.passed,
+                        summary=f"Simulation {rep.status.value} ({rep.duration_ms}ms).",
+                        simulation_status=rep.status.value,
+                        data={"simulation": rep.to_dict()},
+                    )
+                )
+            elif tool_name == "nga_synthesize":
+                findings = args.get("findings")
+                if not isinstance(findings, dict):
+                    outcome = NgaError(
+                        error_code=ErrorCode.INVALID_INPUT.value,
+                        module="nga.interfaces.mcp_server",
+                        message="nga_synthesize requires 'findings' JSON object.",
+                        recoverable=True,
+                    )
+                else:
+                    outcome = self.synthesizer.synthesize_project(
+                        app_name=str(args.get("app_name", "reconstructed_app")),
+                        findings=findings,
+                        output_dir=str(args.get("output_dir", "synthesized_out")),
+                        base_root=self.base_root,
+                        custom_prompt=str(args.get("custom_prompt", "")),
+                        include_android_scaffold=bool(args.get("include_android_scaffold", False)),
+                    )
+            elif tool_name == "nga_rebuild":
+                kind = str(args.get("kind", "")).strip()
+                target = str(args.get("target", "")).strip()
+                if kind not in {"web", "har", "archive", "binary"} or not target:
+                    outcome = NgaError(
+                        error_code=ErrorCode.INVALID_INPUT.value,
+                        module="nga.interfaces.mcp_server",
+                        message="nga_rebuild requires valid 'kind' and non-empty 'target'.",
+                        recoverable=True,
+                    )
+                else:
+                    inspected = _run_target_inspection(kind, target, self.base_root, self.cache, self.handles)
+                    if isinstance(inspected, NgaError):
+                        outcome = inspected
                     else:
-                        outcome = ToolResponse(
-                            module="nga.interfaces.mcp_server",
-                            summary=f"Rebuild complete: {inspected.summary} -> {synth_res.summary}",
-                            simulation_status=synth_res.simulation_status,
-                            data={"inspection_summary": inspected.summary, "synthesis": synth_res.data},
+                        findings = _flatten_inspection_findings(inspected)
+                        app_name = str(args.get("app_name", "")).strip() or Path(target).stem or "reconstructed_app"
+                        synth_res = self.synthesizer.synthesize_project(
+                            app_name=app_name,
+                            findings=findings,
+                            output_dir=str(args.get("output_dir", "rebuilt_app")),
+                            base_root=self.base_root,
+                            custom_prompt=str(args.get("custom_prompt", "")),
+                            include_android_scaffold=(kind == "archive"),
                         )
-        elif tool_name == "nga_agent_turn":
-            outcome = self.agent.run_turn(
-                prompt=str(args.get("prompt", "")),
-                candidate_code=str(args.get("candidate_code", "")),
-                target_label=str(args.get("target_label", "mcp_agent")),
-                target_kind=str(args.get("target_kind", "web")),
-            )
-        elif tool_name == "nga_memory_store":
-            raw_tags = args.get("tags")
-            tags = [str(t) for t in raw_tags] if isinstance(raw_tags, list) else []
-            stored = self.vault.store(
-                title=str(args.get("title", "")),
-                body=str(args.get("body", "")),
-                namespace=str(args.get("namespace", self.agent.namespace)),
-                tags=tags,
-                source="mcp",
-            )
-            outcome = (
-                stored
-                if isinstance(stored, NgaError)
-                else ToolResponse(
+                        if isinstance(synth_res, NgaError):
+                            outcome = synth_res
+                        else:
+                            outcome = ToolResponse(
+                                module="nga.interfaces.mcp_server",
+                                summary=f"Rebuild complete: {inspected.summary} -> {synth_res.summary}",
+                                simulation_status=synth_res.simulation_status,
+                                data={"inspection_summary": inspected.summary, "synthesis": synth_res.data},
+                            )
+            elif tool_name == "nga_agent_turn":
+                outcome = self.agent.run_turn(
+                    prompt=str(args.get("prompt", "")),
+                    candidate_code=str(args.get("candidate_code", "")),
+                    target_label=str(args.get("target_label", "mcp_agent")),
+                    target_kind=str(args.get("target_kind", "web")),
+                )
+            elif tool_name == "nga_memory_store":
+                raw_tags = args.get("tags")
+                tags = [str(t) for t in raw_tags] if isinstance(raw_tags, list) else []
+                stored = self.vault.store(
+                    title=str(args.get("title", "")),
+                    body=str(args.get("body", "")),
+                    namespace=str(args.get("namespace", self.agent.namespace)),
+                    tags=tags,
+                    source="mcp",
+                )
+                outcome = (
+                    stored
+                    if isinstance(stored, NgaError)
+                    else ToolResponse(
+                        module="nga.aaire.memory_vault",
+                        summary=f"Stored memory #{stored.get('id')} in '{stored.get('namespace')}'.",
+                        data={"memory": stored},
+                    )
+                )
+            elif tool_name == "nga_memory_retrieve":
+                ns_val = args.get("namespace")
+                ns = str(ns_val).strip() if isinstance(ns_val, str) and ns_val.strip() else None
+                try:
+                    limit = max(1, min(50, int(args.get("limit", 5) or 5)))
+                except (TypeError, ValueError):
+                    limit = 5
+                hits = self.vault.retrieve(str(args.get("query", "")), namespace=ns, limit=limit)
+                outcome = ToolResponse(
                     module="nga.aaire.memory_vault",
-                    summary=f"Stored memory #{stored.get('id')} in '{stored.get('namespace')}'.",
-                    data={"memory": stored},
+                    summary=f"Retrieved {len(hits)} memory record(s).",
+                    data={"hits": hits, "count": len(hits)},
                 )
-            )
-        elif tool_name == "nga_memory_retrieve":
-            ns_val = args.get("namespace")
-            ns = str(ns_val).strip() if isinstance(ns_val, str) and ns_val.strip() else None
-            limit = int(args.get("limit", 5) or 5)
-            hits = self.vault.retrieve(str(args.get("query", "")), namespace=ns, limit=limit)
-            outcome = ToolResponse(
-                module="nga.aaire.memory_vault",
-                summary=f"Retrieved {len(hits)} memory record(s).",
-                data={"hits": hits, "count": len(hits)},
-            )
-        elif tool_name == "nga_ledger_list":
-            listing = self.ledger.list_obligations()
-            outcome = ToolResponse(
-                module="nga.core.ledger",
-                summary=f"Ledger coverage: {listing['coverage']['verified_percent']}%.",
-                data=listing,
-            )
-        elif tool_name == "nga_ledger_add":
-            oid = str(args.get("obligation_id", "")).strip()
-            added = self.ledger.add_obligation(
-                obligation_id=oid,
-                category=str(args.get("category", "endpoint")),
-                title=str(args.get("title", "")).strip() or oid,
-                status=str(args.get("status", ObligationStatus.PENDING.value)),
-            )
-            outcome = (
-                added
-                if isinstance(added, NgaError)
-                else ToolResponse(
+            elif tool_name == "nga_ledger_list":
+                listing = self.ledger.list_obligations()
+                outcome = ToolResponse(
                     module="nga.core.ledger",
-                    summary=f"Added obligation #{added.handle} ({added.obligation_id}).",
-                    data={"obligation": added.to_dict()},
+                    summary=f"Ledger coverage: {listing['coverage']['verified_percent']}%.",
+                    data=listing,
                 )
-            )
-        elif tool_name == "nga_ledger_update":
-            upd = self.ledger.update_status(
-                str(args.get("obligation_id", "")),
-                str(args.get("status", ObligationStatus.PENDING.value)),
-            )
-            outcome = (
-                upd
-                if isinstance(upd, NgaError)
-                else ToolResponse(
-                    module="nga.core.ledger",
-                    summary=f"Updated obligation #{upd.handle} to {upd.status.value}.",
-                    data={"obligation": upd.to_dict()},
+            elif tool_name == "nga_ledger_add":
+                oid = str(args.get("obligation_id", "")).strip()
+                added = self.ledger.add_obligation(
+                    obligation_id=oid,
+                    category=str(args.get("category", "endpoint")),
+                    title=str(args.get("title", "")).strip() or oid,
+                    status=str(args.get("status", ObligationStatus.PENDING.value)),
                 )
-            )
-        elif tool_name == "nga_brief":
-            label = str(args.get("label", "")).strip()
-            if not label:
+                outcome = (
+                    added
+                    if isinstance(added, NgaError)
+                    else ToolResponse(
+                        module="nga.core.ledger",
+                        summary=f"Added obligation #{added.handle} ({added.obligation_id}).",
+                        data={"obligation": added.to_dict()},
+                    )
+                )
+            elif tool_name == "nga_ledger_update":
+                upd = self.ledger.update_status(
+                    str(args.get("obligation_id", "")),
+                    str(args.get("status", ObligationStatus.PENDING.value)),
+                )
+                outcome = (
+                    upd
+                    if isinstance(upd, NgaError)
+                    else ToolResponse(
+                        module="nga.core.ledger",
+                        summary=f"Updated obligation #{upd.handle} to {upd.status.value}.",
+                        data={"obligation": upd.to_dict()},
+                    )
+                )
+            elif tool_name == "nga_brief":
+                label = str(args.get("label", "")).strip()
+                if not label:
+                    outcome = NgaError(
+                        error_code=ErrorCode.INVALID_INPUT.value,
+                        module="nga.interfaces.mcp_server",
+                        message="nga_brief requires non-empty 'label'.",
+                        recoverable=True,
+                    )
+                else:
+                    outcome = generate_architecture_brief(
+                        target_label=label,
+                        target_kind=str(args.get("kind", "web")),
+                        custom_requirements=str(args.get("custom_requirements", "")),
+                    )
+            else:
                 outcome = NgaError(
                     error_code=ErrorCode.INVALID_INPUT.value,
                     module="nga.interfaces.mcp_server",
-                    message="nga_brief requires non-empty 'label'.",
+                    message=f"Unknown MCP tool: {tool_name}",
                     recoverable=True,
                 )
-            else:
-                outcome = generate_architecture_brief(
-                    target_label=label,
-                    target_kind=str(args.get("kind", "web")),
-                )
-        else:
-            outcome = NgaError(
-                error_code=ErrorCode.INVALID_INPUT.value,
+        except Exception as exc:
+            err = NgaError(
+                error_code=ErrorCode.INTERNAL_ERROR.value,
                 module="nga.interfaces.mcp_server",
-                message=f"Unknown MCP tool: {tool_name}",
+                message=redact_secrets(f"Unhandled error in MCP tool '{tool_name}': {exc}"),
                 recoverable=True,
             )
+            return err.to_dict(), True
 
         if isinstance(outcome, NgaError):
             return outcome.to_dict(), True
         if isinstance(outcome, ToolResponse):
-            return outcome.to_dict(), (not outcome.ok)
+            return outcome.to_dict(), (not bool(outcome.ok))
         return outcome, False
 
     def handle_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -421,14 +483,15 @@ class NgaMcpServer:
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             return _jsonrpc_error(None, -32600, "Invalid JSON-RPC 2.0 request.")
 
+        has_id = "id" in message and message.get("id") is not None
         req_id = message.get("id")
         method = str(message.get("method", "")).strip()
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
 
         if not method:
-            return _jsonrpc_error(req_id, -32600, "Request missing method name.")
+            return _jsonrpc_error(req_id if has_id else None, -32600, "Request missing method name.")
 
-        if method == "notifications/initialized" and req_id is None:
+        if not has_id and method.startswith("notifications/"):
             return None
 
         if method == "ping":
@@ -463,12 +526,27 @@ class NgaMcpServer:
                 },
             )
 
-        return _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
+        return _jsonrpc_error(req_id if has_id else None, -32601, f"Method not found: {method}")
+
+    def handle_rpc(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        """Compatibility alias for JSON-RPC callers invoking `handle_rpc`."""
+        return self.handle_message(message)
 
 
-def run_mcp_stdio_server(project_name: str = "default", base_root: Path | str | None = None) -> int:
+NgaMcpDispatcher = NgaMcpServer
+
+
+def run_mcp_stdio_server(
+    project_name: str = "default",
+    base_root: Path | str | None = None,
+    workspace_base_dir: Path | str | None = None,
+) -> int:
     """Run newline-delimited JSON-RPC 2.0 MCP server over stdin/stdout."""
-    server = NgaMcpServer(project_name=project_name, base_root=base_root)
+    server = NgaMcpServer(
+        project_name=project_name,
+        base_root=base_root,
+        workspace_base_dir=workspace_base_dir,
+    )
     try:
         for raw_line in sys.stdin:
             line = raw_line.strip()
@@ -493,4 +571,4 @@ def run_mcp_stdio_server(project_name: str = "default", base_root: Path | str | 
 
 if __name__ == "__main__":
     raise SystemExit(run_mcp_stdio_server())
-            
+                    

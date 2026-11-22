@@ -1,4 +1,4 @@
-"""Cross-OS Command Line Interface (`nga`) for NextGen-Anything."""
+"""Command-line interface entrypoint for NextGen-Anything (`nga`)."""
 
 from __future__ import annotations
 
@@ -8,90 +8,109 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from nga.aaire.intent_agent import AutonomousIntentAgent
+from nga.aaire.memory_vault import AaireMemoryVault
+from nga.aaire.telegram_bridge import TelegramBotBridge
 from nga.analyzers.archive_pkg import inspect_archive_package
 from nga.analyzers.binary_meta import inspect_binary_target
 from nga.analyzers.network_har import inspect_local_har
 from nga.analyzers.web_js import inspect_local_web_target
 from nga.builder.brief_gen import generate_architecture_brief
+from nga.builder.synthesizer import AutonomousProjectSynthesizer
 from nga.core.cache import NgaCache
 from nga.core.contracts import ErrorCode, NgaError, ObligationStatus, ToolResponse
 from nga.core.doctor import run_environment_doctor
 from nga.core.ledger import ObligationLedger
+from nga.core.security import DEFAULT_MAX_OUTPUT_CHARS, apply_output_budget, redact_secrets
 from nga.core.workspace import NgaWorkspace
+from nga.interfaces.mcp_server import run_mcp_stdio_server
+from nga.interfaces.web_ui import run_web_ui_server
 from nga.runtime.simulator import SimulationGate
 
 
-def _emit_result(result: ToolResponse | NgaError, as_json: bool) -> int:
-    """Print ToolResponse or NgaError cleanly and return process exit code."""
-    if as_json:
-        print(result.to_json(indent=2))
+def _emit_payload(payload: dict[str, Any], max_chars: int = DEFAULT_MAX_OUTPUT_CHARS, offset: int = 0) -> None:
+    """Serialize output cleanly while enforcing output budgets and redacting secrets."""
+    raw = redact_secrets(json.dumps(payload, indent=2, default=str))
+    budgeted = apply_output_budget(raw, max_chars=max_chars, offset=offset)
+    if budgeted["truncated"]:
+        wrapper = {
+            "ok": payload.get("ok", True),
+            "truncated": True,
+            "total_chars": budgeted["total_chars"],
+            "offset": budgeted["offset"],
+            "next_offset": budgeted["next_offset"],
+            "content_slice": budgeted["content"],
+        }
+        sys.stdout.write(json.dumps(wrapper, indent=2) + "\n")
     else:
-        if isinstance(result, NgaError):
-            print(f"[ERROR {result.error_code}] ({result.module}) {result.message}")
-            print(f"Suggested Fix: {result.suggested_fix}")
-        else:
-            print(f"[OK] ({result.module}) {result.summary}")
-            if result.truncated and result.next_offset is not None:
-                print(f"[TRUNCATED] Pass --offset {result.next_offset} for next slice.")
-            print(json.dumps(result.data, indent=2, default=str))
-    return 0 if not isinstance(result, NgaError) else 1
+        sys.stdout.write(raw + "\n")
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
+    """Create the argument parser for `nga` CLI commands."""
     parser = argparse.ArgumentParser(
         prog="nga",
-        description="NextGen-Anything (`nga`) — Analysis, Sandbox Simulation & Reconstruction CLI",
+        description="NextGen-Anything: Cross-OS inspection, sandbox simulation, synthesis, agent & mock runtime.",
     )
-    parser.add_argument("--project", default="default", help="Workspace project name (default: 'default').")
-    parser.add_argument("--root", default=".", help="Base directory allowed for local file inspection (default: '.').")
-    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
-    parser.add_argument("--max-chars", type=int, default=12000, help="Output character budget cap.")
-    parser.add_argument("--offset", type=int, default=0, help="Pagination offset for sliced output.")
+    parser.add_argument("--project", default="default", help="Workspace project name.")
+    parser.add_argument("--root", default=".", help="Base root directory for target files.")
+    parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_OUTPUT_CHARS, help="Max output characters.")
+    parser.add_argument("--offset", type=int, default=0, help="Character offset for paginated output.")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # nga doctor
-    sub.add_parser("doctor", help="Inspect OS, Python version, and optional external toolchains.")
+    sub.add_parser("doctor", help="Inspect host OS, Python version, and optional CLI tools.")
 
-    # nga inspect <kind> <path>
-    p_inspect = sub.add_parser("inspect", help="Inspect web/js, har, archive, or binary target.")
-    p_inspect.add_argument("kind", choices=["web", "har", "archive", "binary"], help="Target inspection category.")
-    p_inspect.add_argument("target", help="Relative or local path to target file.")
+    p_inspect = sub.add_parser("inspect", help="Inspect a local web/JS, HAR, archive, or binary target.")
+    p_inspect.add_argument("kind", choices=["web", "har", "archive", "binary"], help="Target category.")
+    p_inspect.add_argument("target", help="Target path relative to --root.")
 
-    # nga simulate <code>
     p_sim = sub.add_parser("simulate", help="Run Python code inside the isolated sandbox simulation gate.")
     p_sim.add_argument("code", help="Python code snippet to simulate.")
-    p_sim.add_argument("--label", default="cli_snippet", help="Simulation target label.")
-    p_sim.add_argument("--smoke", default="", help="Optional smoke-test assertion code.")
+    p_sim.add_argument("--smoke", default="", help="Optional smoke-test assertions code.")
+    p_sim.add_argument("--label", default="cli_snippet", help="Target label.")
 
-    # nga ledger <subcmd>
-    p_ledger = sub.add_parser("ledger", help="Manage and inspect the Reconstruction Obligation Ledger.")
-    p_ledger.add_argument("subcmd", choices=["list", "add", "verify"], help="Ledger operation.")
-    p_ledger.add_argument("--id", dest="obl_id", default="", help="Obligation ID.")
+    p_synth = sub.add_parser("synthesize", help="Synthesize and sandbox-verify a multi-file app from JSON findings.")
+    p_synth.add_argument("--name", default="reconstructed_app", help="Application name.")
+    p_synth.add_argument("--findings-json", default="{}", help="JSON object of inspection findings.")
+    p_synth.add_argument("--out", default="synthesized_out", help="Output directory relative to --root.")
+
+    p_agent = sub.add_parser("agent", help="Run an autonomous agent turn with memory vault and sandbox gate.")
+    p_agent.add_argument("prompt", help="Goal or instruction for the agent.")
+    p_agent.add_argument("--code", default="", help="Optional Python candidate code.")
+    p_agent.add_argument("--label", default="agent_cli", help="Target label.")
+
+    p_tg = sub.add_parser("telegram", help="Run a single non-blocking Telegram getUpdates poll cycle.")
+    p_tg.add_argument("--limit", type=int, default=10, help="Maximum updates to fetch.")
+
+    p_ledger = sub.add_parser("ledger", help="Manage reconstruction obligations.")
+    p_ledger.add_argument("action", choices=["list", "add", "update"], help="Ledger action.")
+    p_ledger.add_argument("--id", default="", help="Obligation ID.")
     p_ledger.add_argument("--category", default="endpoint", help="Obligation category.")
     p_ledger.add_argument("--title", default="", help="Obligation title.")
-    p_ledger.add_argument("--handle", default="", help="Obligation integer handle or ID for verify.")
-    p_ledger.add_argument("--status", default="", help="Optional status filter for list.")
+    p_ledger.add_argument(
+        "--status",
+        choices=[s.value for s in ObligationStatus],
+        default=ObligationStatus.PENDING.value,
+        help="Obligation status.",
+    )
 
-    # nga brief
-    p_brief = sub.add_parser("brief", help="Generate clean-room architectural blueprint.")
-    p_brief.add_argument("--label", default="target_app", help="Target name/label.")
+    p_brief = sub.add_parser("brief", help="Generate a clean-room architecture and stack blueprint.")
+    p_brief.add_argument("--label", required=True, help="Target/project label.")
     p_brief.add_argument("--kind", default="web", help="Target kind (web, archive, binary).")
 
-    # nga mcp
-    sub.add_parser("mcp", help="Run stdio JSON-RPC Model Context Protocol server.")
+    p_ui = sub.add_parser("ui", help="Start local HTML5/Vanilla-JS dashboard and REST API server.")
+    p_ui.add_argument("--host", default="127.0.0.1", help="Bind host.")
+    p_ui.add_argument("--port", type=int, default=8765, help="Bind port.")
+    p_ui.add_argument("--token", default="", help="Optional API token (or set NGA_API_TOKEN).")
 
-    # nga ui
-    p_ui = sub.add_parser("ui", help="Launch local Web UI dashboard server.")
-    p_ui.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
-    p_ui.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765).")
-
+    sub.add_parser("mcp", help="Run JSON-RPC Model Context Protocol server over stdio.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entrypoint."""
-    parser = _build_parser()
+    """Execute CLI command and return process exit code (0 on success, 1 on error)."""
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     base_root = Path(args.root).resolve()
@@ -99,132 +118,154 @@ def main(argv: list[str] | None = None) -> int:
     cache = NgaCache(ws.root / "cache.sqlite")
     handles = ws.get_handles()
     ledger = ObligationLedger(ws.root / "ledger.json", handles=handles)
+    vault = AaireMemoryVault(ws.root / "memory_vault.sqlite")
+    simulator = SimulationGate()
+
+    if args.command == "mcp":
+        return run_mcp_stdio_server(project_name=args.project, base_root=base_root)
+
+    if args.command == "ui":
+        return run_web_ui_server(
+            host=args.host,
+            port=args.port,
+            project_name=args.project,
+            base_root=base_root,
+            api_token=args.token or None,
+        )
+
+    result: ToolResponse | NgaError | dict[str, Any]
 
     if args.command == "doctor":
-        res: ToolResponse | NgaError = run_environment_doctor(workspace_root=ws.root)
-        return _emit_result(res, args.json)
-
-    if args.command == "inspect":
+        result = run_environment_doctor(workspace_root=ws.root)
+    elif args.command == "inspect":
         if args.kind == "web":
-            res = inspect_local_web_target(
-                args.target,
-                base_root=base_root,
-                cache=cache,
-                handles=handles,
-                max_output_chars=args.max_chars,
-                offset=args.offset,
-            )
+            result = inspect_local_web_target(args.target, base_root=base_root, cache=cache, handles=handles)
         elif args.kind == "har":
-            res = inspect_local_har(
-                args.target,
-                base_root=base_root,
-                cache=cache,
-                handles=handles,
-                max_output_chars=args.max_chars,
-                offset=args.offset,
-            )
+            result = inspect_local_har(args.target, base_root=base_root, cache=cache, handles=handles)
         elif args.kind == "archive":
-            res = inspect_archive_package(
-                args.target,
-                base_root=base_root,
-                cache=cache,
-                handles=handles,
-                max_output_chars=args.max_chars,
-                offset=args.offset,
-            )
+            result = inspect_archive_package(args.target, base_root=base_root, cache=cache, handles=handles)
         else:
-            res = inspect_binary_target(
-                args.target,
-                base_root=base_root,
-                cache=cache,
-                handles=handles,
-                max_output_chars=args.max_chars,
-                offset=args.offset,
-            )
-
-        if not isinstance(res, NgaError):
-            ws.register_handle(f"inspect::{args.kind}::{args.target}", {"kind": args.kind})
-        return _emit_result(res, args.json)
-
-    if args.command == "simulate":
-        gate = SimulationGate()
-        report = gate.simulate_crafted_python(
+            result = inspect_binary_target(args.target, base_root=base_root, cache=cache, handles=handles)
+    elif args.command == "simulate":
+        rep = simulator.simulate_crafted_python(
             code=args.code,
             smoke_assertions_code=args.smoke,
             target_label=args.label,
         )
-        if isinstance(report, NgaError):
-            return _emit_result(report, args.json)
-        res = ToolResponse(
-            module="nga.runtime.simulator",
-            summary=f"Simulation {report.status.value} for '{args.label}' ({report.duration_ms}ms).",
-            simulation_status=report.status.value,
-            data={"simulation": report.to_dict()},
-        )
-        return _emit_result(res, args.json)
+        if isinstance(rep, NgaError):
+            result = rep
+        else:
+            result = ToolResponse(
+                module="nga.runtime.simulator",
+                summary=f"Simulation {rep.status.value} ({rep.duration_ms}ms).",
+                simulation_status=rep.status.value,
+                data={"simulation": rep.to_dict()},
+            )
+    elif args.command == "synthesize":
+        try:
+            parsed_findings = json.loads(args.findings_json)
+            if not isinstance(parsed_findings, dict):
+                parsed_findings = {}
+        except json.JSONDecodeError as exc:
+            parsed_findings = {}
+            result = NgaError(
+                error_code=ErrorCode.INVALID_INPUT.value,
+                module="nga.interfaces.cli",
+                message=f"Invalid --findings-json: {exc}",
+                recoverable=True,
+            )
+            _emit_payload(result.to_dict(), max_chars=args.max_chars, offset=args.offset)
+            return 1
 
-    if args.command == "ledger":
-        if args.subcmd == "list":
-            listing = ledger.list_obligations(status_filter=args.status or None, offset=args.offset)
-            res = ToolResponse(
+        synth = AutonomousProjectSynthesizer(simulator=simulator, workspace=ws, ledger=ledger)
+        result = synth.synthesize_project(
+            app_name=args.name,
+            findings=parsed_findings,
+            output_dir=args.out,
+            base_root=base_root,
+        )
+    elif args.command == "agent":
+        agent = AutonomousIntentAgent(
+            vault=vault,
+            simulator=simulator,
+            ledger=ledger,
+            workspace=ws,
+        )
+        result = agent.run_turn(
+            prompt=args.prompt,
+            candidate_code=args.code,
+            target_label=args.label,
+        )
+    elif args.command == "telegram":
+        bridge = TelegramBotBridge(
+            agent=AutonomousIntentAgent(vault=vault, simulator=simulator, ledger=ledger, workspace=ws),
+            simulator=simulator,
+        )
+        polled = bridge.poll_once(limit=args.limit)
+        if isinstance(polled, NgaError):
+            result = polled
+        else:
+            result = ToolResponse(
+                module="nga.aaire.telegram_bridge",
+                summary=f"Processed {len(polled)} Telegram update(s).",
+                data={"updates": polled},
+            )
+    elif args.command == "ledger":
+        if args.action == "list":
+            listing = ledger.list_obligations()
+            result = ToolResponse(
                 module="nga.core.ledger",
-                summary=f"Ledger coverage: {listing['coverage']['verified_percent']}% verified.",
-                truncated=listing["next_offset"] is not None,
-                next_offset=listing["next_offset"],
+                summary=f"Ledger coverage: {listing['coverage']['verified_percent']}%.",
                 data=listing,
             )
-            return _emit_result(res, args.json)
-
-        if args.subcmd == "add":
+        elif args.action == "add":
             added = ledger.add_obligation(
-                obligation_id=args.obl_id,
+                obligation_id=args.id,
                 category=args.category,
-                title=args.title or args.obl_id,
+                title=args.title or args.id,
+                status=args.status,
             )
-            if isinstance(added, NgaError):
-                return _emit_result(added, args.json)
-            res = ToolResponse(
-                module="nga.core.ledger",
-                summary=f"Added obligation #{added.handle} ({added.obligation_id}).",
-                data={"obligation": added.to_dict()},
+            result = (
+                added
+                if isinstance(added, NgaError)
+                else ToolResponse(
+                    module="nga.core.ledger",
+                    summary=f"Added obligation #{added.handle} ({added.obligation_id}).",
+                    data={"obligation": added.to_dict()},
+                )
             )
-            return _emit_result(res, args.json)
-
-        # verify
-        ident: int | str = int(args.handle) if str(args.handle).isdigit() else str(args.handle)
-        updated = ledger.update_status(ident, ObligationStatus.VERIFIED, notes="Verified via CLI.")
-        if isinstance(updated, NgaError):
-            return _emit_result(updated, args.json)
-        res = ToolResponse(
-            module="nga.core.ledger",
-            summary=f"Marked obligation #{updated.handle} as VERIFIED.",
-            data={"obligation": updated.to_dict()},
+        else:
+            upd = ledger.update_status(args.id, args.status)
+            result = (
+                upd
+                if isinstance(upd, NgaError)
+                else ToolResponse(
+                    module="nga.core.ledger",
+                    summary=f"Updated obligation #{upd.handle} to {upd.status.value}.",
+                    data={"obligation": upd.to_dict()},
+                )
+            )
+    elif args.command == "brief":
+        result = generate_architecture_brief(target_label=args.label, target_kind=args.kind)
+    else:
+        result = NgaError(
+            error_code=ErrorCode.INVALID_INPUT.value,
+            module="nga.interfaces.cli",
+            message=f"Unknown CLI command: {args.command}",
+            recoverable=True,
         )
-        return _emit_result(res, args.json)
 
-    if args.command == "brief":
-        res = generate_architecture_brief(target_label=args.label, target_kind=args.kind)
-        return _emit_result(res, args.json)
+    if isinstance(result, NgaError):
+        _emit_payload(result.to_dict(), max_chars=args.max_chars, offset=args.offset)
+        return 1
+    if isinstance(result, ToolResponse):
+        _emit_payload(result.to_dict(), max_chars=args.max_chars, offset=args.offset)
+        return 0 if result.ok else 1
 
-    if args.command == "mcp":
-        from nga.interfaces.mcp_server import serve_mcp_stdio
-
-        serve_mcp_stdio(project_name=args.project, base_root=base_root)
-        return 0
-
-    if args.command == "ui":
-        from nga.interfaces.web_ui import run_web_ui_server
-
-        return run_web_ui_server(host=args.host, port=args.port, project_name=args.project, base_root=base_root)
-
-    err = NgaError(
-        error_code=ErrorCode.INVALID_INPUT.value,
-        module="nga.interfaces.cli",
-        message=f"Unsupported CLI command: {args.command}",
-    )
-    return _emit_result(err, args.json)
+    _emit_payload(result, max_chars=args.max_chars, offset=args.offset)
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-                            
+    return main()
+    

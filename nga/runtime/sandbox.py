@@ -46,7 +46,7 @@ class ExecutionSandbox:
 
     def _build_restricted_env(self, sandbox_dir: Path) -> dict[str, str]:
         """Construct a sanitized environment dictionary without leaking host secrets."""
-        env: dict[str, str] = {
+        return {
             "PATH": os.environ.get("PATH", ""),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "PYTHONIOENCODING": "utf-8",
@@ -56,13 +56,29 @@ class ExecutionSandbox:
             "TEMP": str(sandbox_dir / "tmp"),
             "TMP": str(sandbox_dir / "tmp"),
         }
-        return env
 
     def _cleanup_dir(self, target_dir: Path) -> None:
         """Remove an ephemeral sandbox folder safely if inside base_sandbox_dir."""
         ok, resolved = safe_resolve_path(self.base_sandbox_dir, target_dir)
         if ok and isinstance(resolved, Path) and resolved != self.base_sandbox_dir.resolve() and resolved.exists():
             shutil.rmtree(resolved, ignore_errors=True)
+
+    @staticmethod
+    def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+        """Safely terminate process and process group across Linux, Android Termux, macOS, and Windows."""
+        if os.name == "posix":
+            try:
+                os.killpg(proc.pid, 9)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
     def run_python_snippet(
         self,
@@ -95,7 +111,10 @@ class ExecutionSandbox:
                 target_label=target_label,
                 status=SimulationStatus.BLOCKED,
                 checks_passed=[],
-                checks_failed=[f"ast_guard:{item.get('issue', 'unsafe_construct')}" for item in findings],
+                checks_failed=[
+                    f"ast_guard:{item.get('issue', item) if isinstance(item, dict) else item}"
+                    for item in findings
+                ],
                 stdout_preview="",
                 stderr_preview=redact_secrets(str(findings)),
                 error_signature=sig,
@@ -106,7 +125,6 @@ class ExecutionSandbox:
                 self._cleanup_dir(run_dir)
             return report
 
-        # Write optional helper files strictly inside run_dir
         if files:
             for rel_name, content in files.items():
                 ok_p, dest_p = safe_resolve_path(run_dir, rel_name)
@@ -149,14 +167,7 @@ class ExecutionSandbox:
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=self.timeout_seconds)
             except subprocess.TimeoutExpired:
-                if os.name == "posix":
-                    try:
-                        os.killpg(proc.pid, 9)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    proc.kill()
-                proc.wait(timeout=5)
+                self._terminate_process_tree(proc)
                 duration_ms = int((time.monotonic() - start_perf) * 1000)
                 err_sig = compute_sha256_text(f"TIMEOUT:{target_label}:{self.timeout_seconds}")[:16]
                 report = SimulationReport(
@@ -208,5 +219,5 @@ class ExecutionSandbox:
             stderr_preview=stderr_clean,
             error_signature=err_sig,
             duration_ms=duration_ms,
-      )
-          
+        )
+        

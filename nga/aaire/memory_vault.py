@@ -99,4 +99,174 @@ class AaireMemoryVault:
             except sqlite3.OperationalError:
                 self._fts_enabled = False
             conn.commit()
-  
+
+    def store(
+        self,
+        title: str,
+        body: str,
+        namespace: str = "agent_general",
+        tags: list[str] | None = None,
+        source: str = "agent",
+    ) -> dict[str, Any] | NgaError:
+        """Redact secrets, store or deduplicate a memory record, and return metadata."""
+        clean_title = redact_secrets(str(title or "")).strip()
+        clean_body = redact_secrets(str(body or "")).strip()
+        if not clean_title and not clean_body:
+            return NgaError(
+                error_code=ErrorCode.INVALID_INPUT.value,
+                module="nga.aaire.memory_vault",
+                message="Memory entry must contain non-empty title or body.",
+                recoverable=True,
+                suggested_fix="Pass non-empty title or body text.",
+            )
+
+        safe_title = clean_title or "untitled_note"
+        safe_ns = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(namespace or "agent_general")).strip("_") or "agent_general"
+        safe_source = redact_secrets(str(source or "agent")).strip() or "agent"
+        tag_list = [redact_secrets(str(t)).strip() for t in (tags or []) if str(t).strip()][:20]
+        tags_encoded = json.dumps(tag_list)
+
+        content_hash = compute_sha256_text(f"{safe_ns}\n{safe_title}\n{clean_body}")
+        now_iso = utc_now_iso()
+
+        with self._lock, self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id, namespace, title, tags_json, source, created_at FROM memories WHERE content_hash = ?",
+                (content_hash,),
+            ).fetchone()
+            if existing is not None:
+                return {
+                    "id": int(existing["id"]),
+                    "content_hash": content_hash,
+                    "namespace": existing["namespace"],
+                    "title": existing["title"],
+                    "tags": json.loads(existing["tags_json"] or "[]"),
+                    "source": existing["source"],
+                    "created_at": existing["created_at"],
+                    "deduplicated": True,
+                }
+
+            cur = conn.execute(
+                """
+                INSERT INTO memories(content_hash, namespace, title, body, tags_json, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (content_hash, safe_ns, safe_title, clean_body, tags_encoded, safe_source, now_iso),
+            )
+            conn.commit()
+            row_id = int(cur.lastrowid or 0)
+
+        return {
+            "id": row_id,
+            "content_hash": content_hash,
+            "namespace": safe_ns,
+            "title": safe_title,
+            "tags": tag_list,
+            "source": safe_source,
+            "created_at": now_iso,
+            "deduplicated": False,
+        }
+
+    def retrieve(
+        self,
+        query: str,
+        namespace: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Retrieve relevant memory chunks using FTS5 BM25 ranking or safe SQL fallback."""
+        safe_limit = max(1, min(50, int(limit)))
+        clean_q = redact_secrets(str(query or "")).strip()
+        if not clean_q:
+            return []
+
+        results: list[dict[str, Any]] = []
+        with self._lock, self._connect() as conn:
+            if self._fts_enabled:
+                fts_q = _build_fts_query(clean_q)
+                if fts_q:
+                    try:
+                        if namespace:
+                            rows = conn.execute(
+                                """
+                                SELECT m.id, m.namespace, m.title, m.body, m.tags_json, m.source, m.created_at,
+                                       bm25(memories_fts) AS rank_score
+                                FROM memories_fts
+                                JOIN memories m ON m.id = memories_fts.rowid
+                                WHERE memories_fts MATCH ? AND m.namespace = ?
+                                ORDER BY rank_score ASC
+                                LIMIT ?
+                                """,
+                                (fts_q, namespace, safe_limit),
+                            ).fetchall()
+                        else:
+                            rows = conn.execute(
+                                """
+                                SELECT m.id, m.namespace, m.title, m.body, m.tags_json, m.source, m.created_at,
+                                       bm25(memories_fts) AS rank_score
+                                FROM memories_fts
+                                JOIN memories m ON m.id = memories_fts.rowid
+                                WHERE memories_fts MATCH ?
+                                ORDER BY rank_score ASC
+                                LIMIT ?
+                                """,
+                                (fts_q, safe_limit),
+                            ).fetchall()
+
+                        for r in rows:
+                            results.append(
+                                {
+                                    "id": int(r["id"]),
+                                    "namespace": r["namespace"],
+                                    "title": r["title"],
+                                    "body": r["body"],
+                                    "tags": json.loads(r["tags_json"] or "[]"),
+                                    "source": r["source"],
+                                    "created_at": r["created_at"],
+                                    "rank_score": float(r["rank_score"]),
+                                }
+                            )
+                        if results:
+                            return results
+                    except sqlite3.OperationalError:
+                        pass
+
+            like_pat = f"%{clean_q[:120]}%"
+            if namespace:
+                rows = conn.execute(
+                    """
+                    SELECT id, namespace, title, body, tags_json, source, created_at
+                    FROM memories
+                    WHERE namespace = ? AND (title LIKE ? OR body LIKE ? OR tags_json LIKE ?)
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (namespace, like_pat, like_pat, like_pat, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, namespace, title, body, tags_json, source, created_at
+                    FROM memories
+                    WHERE title LIKE ? OR body LIKE ? OR tags_json LIKE ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (like_pat, like_pat, like_pat, safe_limit),
+                ).fetchall()
+
+            for r in rows:
+                results.append(
+                    {
+                        "id": int(r["id"]),
+                        "namespace": r["namespace"],
+                        "title": r["title"],
+                        "body": r["body"],
+                        "tags": json.loads(r["tags_json"] or "[]"),
+                        "source": r["source"],
+                        "created_at": r["created_at"],
+                        "rank_score": 0.0,
+                    }
+                )
+
+        return results
+        

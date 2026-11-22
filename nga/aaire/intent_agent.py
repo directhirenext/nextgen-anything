@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 import re
 from typing import Any
 
@@ -14,6 +13,7 @@ from nga.core.contracts import (
     ErrorCode,
     NgaError,
     ObligationStatus,
+    SimulationReport,
     SimulationStatus,
     ToolResponse,
     utc_now_iso,
@@ -72,6 +72,29 @@ def extract_python_candidate(prompt: str) -> str:
     return ""
 
 
+def _parse_verification_result(outcome: Any) -> tuple[bool, int, str]:
+    """Normalize return values from ParityVerificationLoop or SimulationGate."""
+    if isinstance(outcome, NgaError):
+        return False, 0, outcome.message
+    if isinstance(outcome, SimulationReport):
+        return bool(outcome.passed), 1, outcome.status.value
+    if isinstance(outcome, ToolResponse):
+        payload = outcome.data if isinstance(outcome.data, dict) else {}
+        passed = bool(
+            payload.get(
+                "passed",
+                outcome.ok and outcome.simulation_status == SimulationStatus.SIMULATION_PASSED.value,
+            )
+        )
+        iters = int(payload.get("iterations_used", payload.get("attempts", 1)) or 0)
+        return passed, iters, outcome.summary
+    if isinstance(outcome, dict):
+        passed = bool(outcome.get("passed", outcome.get("ok", False)))
+        iters = int(outcome.get("iterations_used", outcome.get("attempts", 1)) or 0)
+        return passed, iters, str(outcome.get("summary", ""))
+    return False, 0, "Unknown verification output"
+
+
 class AutonomousIntentAgent:
     """Executes goal-driven turns using memory vault recall, sandbox simulation, and ledger sync."""
 
@@ -89,6 +112,31 @@ class AutonomousIntentAgent:
         self.ledger = ledger
         self.workspace = workspace
         self.parity_loop = ParityVerificationLoop(simulator=self.simulator)
+
+    def _verify_candidate_code(self, code: str, target_label: str) -> tuple[bool, dict[str, Any]]:
+        """Run code through parity verification loop with direct sandbox gate fallback."""
+        candidates = [{"label": target_label, "code": code}]
+        try:
+            loop_res = self.parity_loop.run_candidates(
+                candidates,
+                config=ParityLoopConfig(max_iterations=2, stall_threshold=2),
+            )
+            passed, iters, detail = _parse_verification_result(loop_res)
+            return passed, {
+                "tool": "parity_loop",
+                "status": "passed" if passed else "failed",
+                "iterations_used": iters,
+                "detail": detail,
+            }
+        except (TypeError, AttributeError):
+            rep = self.simulator.simulate_crafted_python(code=code, target_label=target_label)
+            passed, iters, detail = _parse_verification_result(rep)
+            return passed, {
+                "tool": "simulation_gate",
+                "status": "passed" if passed else "failed",
+                "iterations_used": iters,
+                "detail": detail,
+            }
 
     def run_turn(
         self,
@@ -116,30 +164,8 @@ class AutonomousIntentAgent:
 
         code_to_test = (candidate_code or "").strip() or extract_python_candidate(clean_prompt)
         if code_to_test:
-            candidates = [{"label": target_label, "code": code_to_test}]
-            loop_res = self.parity_loop.run_candidates(
-                candidates,
-                config=ParityLoopConfig(max_iterations=2, stall_threshold=2),
-            )
-            if isinstance(loop_res, NgaError):
-                sim_passed = False
-                actions_taken.append(
-                    {
-                        "tool": "parity_loop",
-                        "status": "failed",
-                        "error_code": loop_res.error_code,
-                        "message": loop_res.message,
-                    }
-                )
-            else:
-                sim_passed = bool(loop_res.get("passed", False))
-                actions_taken.append(
-                    {
-                        "tool": "parity_loop",
-                        "status": "passed" if sim_passed else "failed",
-                        "iterations_used": loop_res.get("iterations_used", 0),
-                    }
-                )
+            sim_passed, action_meta = self._verify_candidate_code(code_to_test, target_label)
+            actions_taken.append(action_meta)
 
         if intent == "generate_brief" or (intent == "inspect_and_plan" and not code_to_test):
             brief_res = generate_architecture_brief(target_label=target_label, target_kind=target_kind)
@@ -217,5 +243,5 @@ class AutonomousIntentAgent:
             summary=summary,
             simulation_status=SimulationStatus.SIMULATION_PASSED.value if sim_passed else SimulationStatus.SIMULATION_FAILED.value,
             data={"turn": turn_obj.to_dict()},
-  )
-      
+)
+            

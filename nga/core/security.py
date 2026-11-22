@@ -1,4 +1,4 @@
-"""Security guardrails: secret/PII redaction, path traversal guards, AST safety checks, and output token budgets."""
+"""Security, secret redaction, path traversal containment, AST guard, and output budgets."""
 
 from __future__ import annotations
 
@@ -12,200 +12,224 @@ from nga.core.contracts import ErrorCode, NgaError
 
 DEFAULT_MAX_OUTPUT_CHARS = 12000
 DEFAULT_MAX_ARCHIVE_ENTRIES = 2000
-DEFAULT_MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024  # 100 MB
+DEFAULT_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024  # 50 MB
 
-SENSITIVE_HEADER_NAMES = frozenset(
-    {
-        "authorization",
-        "cookie",
-        "set-cookie",
-        "x-api-key",
-        "api-key",
-        "x-auth-token",
-        "proxy-authorization",
-    }
-)
+_SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[A-Za-z0-9._\-~+/=]+"), r"\1[REDACTED_TOKEN]"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-~+/=]{12,}"), r"\1[REDACTED_TOKEN]"),
+    (
+        re.compile(r'(?i)(["\']?(?:api[_-]?key|secret|token|password|passwd|access[_-]?token|refresh[_-]?token|private[_-]?key)["\']?\s*[:=]\s*["\']?)([^"\'\s,;}{]{6,})(["\']?)'),
+        r"\1[REDACTED]\3",
+    ),
+    (re.compile(r"\b(sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z\-_]{25,})\b"), "[REDACTED_CREDENTIAL]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+]
 
-_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)(bearer\s+)[a-z0-9\-._~+/]+=*"),
-    re.compile(r"(?i)((?:api[_-]?key|secret|token|password|passwd|pwd)\s*[:=]\s*['\"]?)([^'\"\s,&;]+)"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
-    re.compile(r"\b(?:sk-|ghp_|gho_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{10,}\b"),
-)
+_SENSITIVE_HEADER_KEYS = {
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-xsrf-token",
+}
 
-_DANGEROUS_CALLS = frozenset(
-    {
-        "eval",
-        "exec",
-        "compile",
-        "__import__",
-        "input",
-    }
-)
+_BLOCKED_AST_MODULES = {
+    "os",
+    "sys",
+    "subprocess",
+    "shutil",
+    "socket",
+    "ctypes",
+    "importlib",
+    "pickle",
+    "marshal",
+    "pty",
+    "resource",
+    "signal",
+    "multiprocessing",
+    "threading",
+    "builtins",
+    "inspect",
+    "gc",
+}
 
-_DANGEROUS_ATTR_CALLS = frozenset(
-    {
-        ("os", "system"),
-        ("os", "popen"),
-        ("os", "spawnl"),
-        ("os", "spawnle"),
-        ("os", "spawnlp"),
-        ("os", "spawnlpe"),
-        ("os", "spawnv"),
-        ("os", "spawnve"),
-        ("os", "spawnvp"),
-        ("os", "spawnvpe"),
-        ("subprocess", "Popen"),
-        ("subprocess", "run"),
-        ("subprocess", "call"),
-        ("subprocess", "check_output"),
-        ("subprocess", "check_call"),
-        ("shutil", "rmtree"),
-    }
-)
+_BLOCKED_AST_CALLS = {
+    "eval",
+    "exec",
+    "compile",
+    "__import__",
+    "open",
+    "input",
+    "breakpoint",
+    "getattr",
+    "setattr",
+    "delattr",
+    "hasattr",
+    "globals",
+    "locals",
+    "vars",
+    "dir",
+}
+
+_BLOCKED_DUNDER_ATTRS = {
+    "__class__",
+    "__base__",
+    "__bases__",
+    "__subclasses__",
+    "__mro__",
+    "__globals__",
+    "__builtins__",
+    "__code__",
+    "__closure__",
+    "__import__",
+    "__loader__",
+    "__spec__",
+}
 
 
-def redact_secrets(text: str, mask: str = "[REDACTED]") -> str:
-    """Redact common API keys, bearer tokens, JWTs, and credential assignments from text."""
+def redact_secrets(text: str) -> str:
+    """Mask bearer tokens, API keys, passwords, and private keys in arbitrary text."""
     if not text:
         return text
-    result = text
-    for idx, pattern in enumerate(_TOKEN_PATTERNS):
-        if idx in (0, 1):
-            result = pattern.sub(rf"\1{mask}", result)
-        else:
-            result = pattern.sub(mask, result)
-    return result
+    sanitized = text
+    for pattern, replacement in _SECRET_PATTERNS:
+        sanitized = pattern.sub(replacement, sanitized)
+    return sanitized
 
 
-def sanitize_headers(headers: dict[str, Any] | list[tuple[str, Any]] | None) -> dict[str, str]:
-    """Normalize HTTP headers, deduplicate case-insensitively, and mask sensitive values."""
-    normalized: dict[str, str] = {}
+def sanitize_headers(headers: dict[str, Any] | list[dict[str, Any]] | None) -> dict[str, str]:
+    """Deduplicate HTTP headers case-insensitively and redact sensitive auth/cookie values."""
     if not headers:
-        return normalized
+        return {}
+    normalized: dict[str, str] = {}
+    items: list[tuple[str, str]] = []
 
-    pairs: list[tuple[str, str]]
     if isinstance(headers, dict):
-        pairs = [(str(k), str(v)) for k, v in headers.items()]
-    else:
-        pairs = [(str(k), str(v)) for k, v in headers]
+        items = [(str(k), str(v)) for k, v in headers.items()]
+    elif isinstance(headers, list):
+        for entry in headers:
+            if isinstance(entry, dict) and "name" in entry:
+                items.append((str(entry.get("name", "")), str(entry.get("value", ""))))
 
-    for raw_name, raw_val in pairs:
-        name = raw_name.strip()
-        if not name:
+    for raw_key, raw_val in items:
+        key = raw_key.strip()
+        if not key:
             continue
-        if name.lower() in SENSITIVE_HEADER_NAMES:
-            value = "[REDACTED]"
+        lower_key = key.lower()
+        canonical_key = next((existing for existing in normalized if existing.lower() == lower_key), key)
+        if lower_key in _SENSITIVE_HEADER_KEYS:
+            normalized[canonical_key] = "[REDACTED_HEADER]"
         else:
-            value = redact_secrets(raw_val.strip())
-        normalized[name] = value
-
+            normalized[canonical_key] = redact_secrets(raw_val.strip())
     return normalized
 
 
-def safe_resolve_path(base_dir: Path, target_rel_or_abs: str | Path) -> tuple[bool, Path | NgaError]:
-    """Ensure target path stays strictly inside base_dir (prevents Zip-Slip and path traversal)."""
+def safe_resolve_path(base_dir: Path, target_path: str | Path) -> tuple[bool, Path | NgaError]:
+    """Resolve `target_path` inside `base_dir` while blocking symlink escapes and traversal."""
     try:
-        root = base_dir.resolve()
-        raw_path = Path(target_rel_or_abs)
-        candidate = (root / raw_path).resolve() if not raw_path.is_absolute() else raw_path.resolve()
-        if candidate == root or root in candidate.parents:
-            return True, candidate
+        base_resolved = base_dir.resolve()
+        raw_target = Path(target_path)
+        candidate = raw_target.resolve() if raw_target.is_absolute() else (base_resolved / raw_target).resolve()
+        candidate.relative_to(base_resolved)
+        return True, candidate
+    except ValueError:
         return False, NgaError(
             error_code=ErrorCode.PATH_TRAVERSAL.value,
             module="nga.core.security",
-            message=f"Path escapes allowed root directory: {target_rel_or_abs}",
+            message=f"Path traversal blocked: '{target_path}' escapes base directory '{base_dir}'.",
             recoverable=False,
-            suggested_fix="Provide a path strictly inside the authorized workspace or sandbox directory.",
+            suggested_fix="Provide a relative path strictly inside the active workspace or allowed root.",
         )
-    except Exception as exc:
+    except OSError as exc:
         return False, NgaError(
             error_code=ErrorCode.INVALID_INPUT.value,
             module="nga.core.security",
-            message=f"Invalid path value '{target_rel_or_abs}': {exc}",
+            message=f"Invalid filesystem path '{target_path}': {exc}",
             recoverable=True,
-            suggested_fix="Check path syntax and characters.",
+            suggested_fix="Verify the path string contains valid OS characters.",
         )
 
 
 def sanitize_archive_member_name(member_name: str) -> tuple[bool, str | NgaError]:
-    """Validate archive entry names against traversal, drive prefixes, and trailing-dot collisions."""
+    """Validate archive member entry name against Zip-Slip traversal and trailing-dot collisions."""
     cleaned = member_name.replace("\\", "/").strip()
-    if not cleaned or cleaned.startswith("/") or (len(cleaned) >= 2 and cleaned[1] == ":"):
+    if not cleaned or cleaned.startswith("/") or cleaned.startswith("~"):
         return False, NgaError(
             error_code=ErrorCode.PATH_TRAVERSAL.value,
             module="nga.core.security",
-            message=f"Unsafe archive member path: {member_name}",
+            message=f"Unsafe archive entry path rejected: '{member_name}'",
             recoverable=False,
-            suggested_fix="Remove leading slashes or drive letters from archive entries.",
+            suggested_fix="Strip leading slashes or home prefixes from archive entries.",
         )
 
-    parts = [p for p in cleaned.split("/") if p and p != "."]
-    if any(p == ".." for p in parts):
-        return False, NgaError(
-            error_code=ErrorCode.PATH_TRAVERSAL.value,
-            module="nga.core.security",
-            message=f"Parent directory traversal ('..') detected in archive member: {member_name}",
-            recoverable=False,
-            suggested_fix="Reject or sanitize archive entries containing '..'.",
-        )
-
+    parts = [p for p in cleaned.split("/") if p not in ("", ".")]
     if not parts:
         return False, NgaError(
             error_code=ErrorCode.INVALID_INPUT.value,
             module="nga.core.security",
-            message=f"Empty archive member path: {member_name}",
+            message=f"Empty normalized archive entry: '{member_name}'",
             recoverable=True,
-            suggested_fix="Skip empty archive directory entries.",
+            suggested_fix="Ignore directory-only or empty archive entries.",
         )
 
-    safe_parts = [p.rstrip(".") if p.endswith(".") and p not in {".", ".."} else p for p in parts]
-    safe_parts = [p if p else "_entry_" for p in safe_parts]
+    safe_parts: list[str] = []
+    for part in parts:
+        if part == ".." or ":" in part:
+            return False, NgaError(
+                error_code=ErrorCode.PATH_TRAVERSAL.value,
+                module="nga.core.security",
+                message=f"Archive entry contains traversal or drive segment: '{member_name}'",
+                recoverable=False,
+                suggested_fix="Reject archives containing '..' or drive specifiers.",
+            )
+        normalized_part = part.rstrip(". ") or "_"
+        safe_parts.append(normalized_part)
+
     return True, "/".join(safe_parts)
 
 
-def check_python_ast_safety(source_code: str) -> dict[str, Any]:
-    """Perform static AST analysis on Python code before sandbox simulation/execution."""
-    findings: list[dict[str, Any]] = []
+def check_python_ast_safety(code: str) -> dict[str, Any]:
+    """Inspect Python source AST for syntax errors, dangerous imports, calls, and dunder reflection."""
     try:
-        tree = ast.parse(source_code)
+        tree = ast.parse(code)
     except SyntaxError as exc:
         return {
             "safe": False,
             "syntax_valid": False,
-            "findings": [
-                {
-                    "line": exc.lineno or 1,
-                    "severity": "error",
-                    "issue": f"SyntaxError: {exc.msg}",
-                }
-            ],
+            "findings": [f"SyntaxError at line {exc.lineno}: {exc.msg}"],
         }
 
+    findings: list[dict[str, Any]] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in _DANGEROUS_CALLS:
-                findings.append(
-                    {
-                        "line": getattr(node, "lineno", 0),
-                        "severity": "high",
-                        "issue": f"Potentially unsafe builtin call '{node.func.id}()'",
-                    }
-                )
-            elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-                pair = (node.func.value.id, node.func.attr)
-                if pair in _DANGEROUS_ATTR_CALLS:
-                    findings.append(
-                        {
-                            "line": getattr(node, "lineno", 0),
-                            "severity": "high",
-                            "issue": f"Restricted system call '{pair[0]}.{pair[1]}()'",
-                        }
-                    )
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root_pkg = alias.name.split(".")[0]
+                if root_pkg in _BLOCKED_AST_MODULES:
+                    findings.append({"line": node.lineno, "issue": f"Blocked import: {alias.name}"})
+        elif isinstance(node, ast.ImportFrom):
+            root_pkg = (node.module or "").split(".")[0]
+            if root_pkg in _BLOCKED_AST_MODULES:
+                findings.append({"line": node.lineno, "issue": f"Blocked from-import: {node.module}"})
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _BLOCKED_DUNDER_ATTRS:
+                findings.append({"line": node.lineno, "issue": f"Blocked dunder reflection attribute: {node.attr}"})
+        elif isinstance(node, ast.Name):
+            if node.id in _BLOCKED_DUNDER_ATTRS:
+                findings.append({"line": node.lineno, "issue": f"Blocked dunder identifier: {node.id}"})
+        elif isinstance(node, ast.Call):
+            func_name = ""
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+            if func_name in _BLOCKED_AST_CALLS:
+                findings.append({"line": node.lineno, "issue": f"Blocked builtin/call: {func_name}"})
 
-    high_count = sum(1 for item in findings if item.get("severity") == "high")
     return {
-        "safe": high_count == 0,
+        "safe": len(findings) == 0,
         "syntax_valid": True,
         "findings": findings,
     }
@@ -216,40 +240,29 @@ def apply_output_budget(
     max_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
     offset: int = 0,
 ) -> dict[str, Any]:
-    """Slice text with offset and enforce a strict character budget so LLM context windows stay bounded."""
-    budget = max(256, int(max_chars))
-    start = max(0, int(offset))
+    """Enforce deterministic output budget with offset pagination metadata."""
+    safe_offset = max(0, int(offset))
+    safe_limit = max(256, int(max_chars))
     total_len = len(text)
-
-    if start >= total_len:
-        return {
-            "content": "",
-            "total_chars": total_len,
-            "offset": start,
-            "returned_chars": 0,
-            "truncated": False,
-            "next_offset": None,
-        }
-
-    chunk = text[start : start + budget]
-    next_off = start + len(chunk)
-    is_truncated = next_off < total_len
-
+    sliced = text[safe_offset : safe_offset + safe_limit]
+    end_pos = safe_offset + len(sliced)
+    truncated = end_pos < total_len
     return {
-        "content": chunk,
+        "content": sliced,
         "total_chars": total_len,
-        "offset": start,
-        "returned_chars": len(chunk),
-        "truncated": is_truncated,
-        "next_offset": next_off if is_truncated else None,
+        "offset": safe_offset,
+        "returned_chars": len(sliced),
+        "truncated": truncated,
+        "next_offset": end_pos if truncated else None,
     }
 
 
+def compute_sha256_bytes(data: bytes) -> str:
+    """Return lowercase SHA-256 hex digest for raw bytes."""
+    return hashlib.sha256(data).hexdigest()
+
+
 def compute_sha256_text(text: str) -> str:
-    """Compute SHA-256 hex digest for a UTF-8 string."""
+    """Return lowercase SHA-256 hex digest for UTF-8 text."""
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
-
-def compute_sha256_bytes(data: bytes) -> str:
-    """Compute SHA-256 hex digest for raw bytes."""
-    return hashlib.sha256(data).hexdigest()

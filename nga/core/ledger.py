@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
+import uuid
 
 from nga.core.contracts import (
     ErrorCode,
@@ -15,17 +17,56 @@ from nga.core.contracts import (
     utc_now_iso,
 )
 from nga.core.security import compute_sha256_text
+from nga.core.workspace import WorkspaceLock
+
+
+def _parse_status(status: ObligationStatus | str) -> ObligationStatus | NgaError:
+    if isinstance(status, ObligationStatus):
+        return status
+    try:
+        return ObligationStatus(str(status).strip().lower())
+    except ValueError:
+        return NgaError(
+            error_code=ErrorCode.INVALID_INPUT.value,
+            module="nga.core.ledger",
+            message=f"Invalid obligation status: {status}",
+            recoverable=True,
+            suggested_fix="Use one of: pending, in_progress, verified, skipped.",
+        )
 
 
 class ObligationLedger:
-    """Tracks obligations (routes, endpoints, modules, behaviors) and computes coverage metrics."""
+    """Thread- and process-safe ledger tracking obligations and coverage metrics."""
 
-    def __init__(self, ledger_path: Path, handles: HandleRegistry | None = None) -> None:
+    def __init__(self, ledger_path: Path | str, handles: HandleRegistry | None = None) -> None:
         self.ledger_path = Path(ledger_path)
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = WorkspaceLock(self.ledger_path.with_suffix(".lock"))
         self.handles = handles if handles is not None else HandleRegistry()
-        if not self.ledger_path.exists():
-            self._save_raw({"updated_at": utc_now_iso(), "items": []})
+        with self._lock:
+            if not self.ledger_path.exists():
+                self._save_raw({"updated_at": utc_now_iso(), "items": []})
+            else:
+                self._hydrate_existing_handles()
+
+    def _hydrate_existing_handles(self) -> None:
+        """Restore persisted obligation handles into the registry to prevent ID collisions."""
+        store = self._load_raw()
+        for entry in store.get("items", []):
+            if not isinstance(entry, dict):
+                continue
+            oid = str(entry.get("obligation_id", "")).strip()
+            raw_h = entry.get("handle")
+            if not oid:
+                continue
+            meta = {
+                "category": str(entry.get("category", "general")),
+                "title": str(entry.get("title", oid)),
+            }
+            if isinstance(raw_h, int) and raw_h > 0:
+                self.handles.register_with_handle(raw_h, f"obligation::{oid}", meta)
+            else:
+                self.handles.register(f"obligation::{oid}", meta)
 
     def _load_raw(self) -> dict[str, Any]:
         try:
@@ -40,9 +81,14 @@ class ObligationLedger:
 
     def _save_raw(self, payload: dict[str, Any]) -> None:
         payload["updated_at"] = utc_now_iso()
-        tmp_path = self.ledger_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        tmp_path.replace(self.ledger_path)
+        tmp_name = f".{self.ledger_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+        tmp_path = self.ledger_path.parent / tmp_name
+        try:
+            tmp_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            tmp_path.replace(self.ledger_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
     def add_obligation(
         self,
@@ -54,9 +100,9 @@ class ObligationLedger:
         evidence_text: str = "",
     ) -> LedgerObligation | NgaError:
         """Add a new obligation or update an existing one by obligation_id."""
-        clean_id = str(obligation_id).strip()
-        clean_cat = str(category).strip() or "general"
-        clean_title = str(title).strip()
+        clean_id = str(obligation_id or "").strip()
+        clean_cat = str(category or "").strip() or "general"
+        clean_title = str(title or "").strip()
         if not clean_id or not clean_title:
             return NgaError(
                 error_code=ErrorCode.INVALID_INPUT.value,
@@ -66,65 +112,78 @@ class ObligationLedger:
                 suggested_fix="Provide non-empty obligation_id and title strings.",
             )
 
-        parsed_status = (
-            status
-            if isinstance(status, ObligationStatus)
-            else ObligationStatus(str(status).strip().lower())
-        )
+        parsed_status = _parse_status(status)
+        if isinstance(parsed_status, NgaError):
+            return parsed_status
+
         evidence_hash = compute_sha256_text(evidence_text) if evidence_text else ""
-        handle = self.handles.register(
-            f"obligation::{clean_id}",
-            metadata={"category": clean_cat, "title": clean_title},
-        )
 
-        store = self._load_raw()
-        items: list[dict[str, Any]] = store["items"]
-        now_iso = utc_now_iso()
+        with self._lock:
+            store = self._load_raw()
+            items: list[dict[str, Any]] = store["items"]
+            now_iso = utc_now_iso()
 
-        for entry in items:
-            if str(entry.get("obligation_id", "")).strip() == clean_id:
-                entry["category"] = clean_cat
-                entry["title"] = clean_title
-                entry["status"] = parsed_status.value
-                if notes:
-                    entry["notes"] = notes
-                if evidence_hash:
-                    entry["evidence_hash"] = evidence_hash
-                entry["updated_at"] = now_iso
-                self._save_raw(store)
-                return LedgerObligation(
-                    handle=handle,
-                    obligation_id=clean_id,
-                    category=clean_cat,
-                    title=clean_title,
-                    status=parsed_status,
-                    notes=str(entry.get("notes", "")),
-                    evidence_hash=str(entry.get("evidence_hash", "")),
-                    updated_at=now_iso,
-                )
+            for entry in items:
+                if str(entry.get("obligation_id", "")).strip() == clean_id:
+                    existing_h = entry.get("handle")
+                    if isinstance(existing_h, int) and existing_h > 0:
+                        handle = self.handles.register_with_handle(
+                            existing_h,
+                            f"obligation::{clean_id}",
+                            metadata={"category": clean_cat, "title": clean_title},
+                        )
+                    else:
+                        handle = self.handles.register(
+                            f"obligation::{clean_id}",
+                            metadata={"category": clean_cat, "title": clean_title},
+                        )
+                    entry["handle"] = handle
+                    entry["category"] = clean_cat
+                    entry["title"] = clean_title
+                    entry["status"] = parsed_status.value
+                    if notes:
+                        entry["notes"] = notes
+                    if evidence_hash:
+                        entry["evidence_hash"] = evidence_hash
+                    entry["updated_at"] = now_iso
+                    self._save_raw(store)
+                    return LedgerObligation(
+                        handle=handle,
+                        obligation_id=clean_id,
+                        category=clean_cat,
+                        title=clean_title,
+                        status=parsed_status,
+                        notes=str(entry.get("notes", "")),
+                        evidence_hash=str(entry.get("evidence_hash", "")),
+                        updated_at=now_iso,
+                    )
 
-        new_item = {
-            "handle": handle,
-            "obligation_id": clean_id,
-            "category": clean_cat,
-            "title": clean_title,
-            "status": parsed_status.value,
-            "notes": notes,
-            "evidence_hash": evidence_hash,
-            "updated_at": now_iso,
-        }
-        items.append(new_item)
-        self._save_raw(store)
-        return LedgerObligation(
-            handle=handle,
-            obligation_id=clean_id,
-            category=clean_cat,
-            title=clean_title,
-            status=parsed_status,
-            notes=notes,
-            evidence_hash=evidence_hash,
-            updated_at=now_iso,
-        )
+            handle = self.handles.register(
+                f"obligation::{clean_id}",
+                metadata={"category": clean_cat, "title": clean_title},
+            )
+            new_item = {
+                "handle": handle,
+                "obligation_id": clean_id,
+                "category": clean_cat,
+                "title": clean_title,
+                "status": parsed_status.value,
+                "notes": notes,
+                "evidence_hash": evidence_hash,
+                "updated_at": now_iso,
+            }
+            items.append(new_item)
+            self._save_raw(store)
+            return LedgerObligation(
+                handle=handle,
+                obligation_id=clean_id,
+                category=clean_cat,
+                title=clean_title,
+                status=parsed_status,
+                notes=notes,
+                evidence_hash=evidence_hash,
+                updated_at=now_iso,
+            )
 
     def update_status(
         self,
@@ -133,20 +192,9 @@ class ObligationLedger:
         notes: str | None = None,
     ) -> LedgerObligation | NgaError:
         """Update status (and optional notes) of an obligation using integer handle or obligation_id."""
-        try:
-            parsed_status = (
-                status
-                if isinstance(status, ObligationStatus)
-                else ObligationStatus(str(status).strip().lower())
-            )
-        except ValueError:
-            return NgaError(
-                error_code=ErrorCode.INVALID_INPUT.value,
-                module="nga.core.ledger",
-                message=f"Invalid obligation status: {status}",
-                recoverable=True,
-                suggested_fix="Use one of: pending, in_progress, verified, skipped.",
-            )
+        parsed_status = _parse_status(status)
+        if isinstance(parsed_status, NgaError):
+            return parsed_status
 
         target_handle: int | None = None
         target_id: str | None = None
@@ -156,7 +204,7 @@ class ObligationLedger:
             if resolved and resolved.startswith("obligation::"):
                 target_id = resolved.removeprefix("obligation::")
         else:
-            raw_str = str(handle_or_id).strip()
+            raw_str = str(handle_or_id or "").strip()
             if raw_str.isdigit():
                 target_handle = int(raw_str)
                 resolved = self.handles.resolve_key(target_handle)
@@ -165,27 +213,28 @@ class ObligationLedger:
             else:
                 target_id = raw_str
 
-        store = self._load_raw()
-        now_iso = utc_now_iso()
-        for entry in store["items"]:
-            matches_handle = target_handle is not None and int(entry.get("handle", -1)) == target_handle
-            matches_id = target_id is not None and str(entry.get("obligation_id", "")) == target_id
-            if matches_handle or matches_id:
-                entry["status"] = parsed_status.value
-                if notes is not None:
-                    entry["notes"] = notes
-                entry["updated_at"] = now_iso
-                self._save_raw(store)
-                return LedgerObligation(
-                    handle=int(entry.get("handle", target_handle or 0)),
-                    obligation_id=str(entry.get("obligation_id", "")),
-                    category=str(entry.get("category", "general")),
-                    title=str(entry.get("title", "")),
-                    status=parsed_status,
-                    notes=str(entry.get("notes", "")),
-                    evidence_hash=str(entry.get("evidence_hash", "")),
-                    updated_at=now_iso,
-                )
+        with self._lock:
+            store = self._load_raw()
+            now_iso = utc_now_iso()
+            for entry in store["items"]:
+                matches_handle = target_handle is not None and int(entry.get("handle", -1)) == target_handle
+                matches_id = target_id is not None and str(entry.get("obligation_id", "")) == target_id
+                if matches_handle or matches_id:
+                    entry["status"] = parsed_status.value
+                    if notes is not None:
+                        entry["notes"] = notes
+                    entry["updated_at"] = now_iso
+                    self._save_raw(store)
+                    return LedgerObligation(
+                        handle=int(entry.get("handle", target_handle or 0)),
+                        obligation_id=str(entry.get("obligation_id", "")),
+                        category=str(entry.get("category", "general")),
+                        title=str(entry.get("title", "")),
+                        status=parsed_status,
+                        notes=str(entry.get("notes", "")),
+                        evidence_hash=str(entry.get("evidence_hash", "")),
+                        updated_at=now_iso,
+                    )
 
         return NgaError(
             error_code=ErrorCode.NOT_FOUND.value,
@@ -202,7 +251,8 @@ class ObligationLedger:
         limit: int = 50,
     ) -> dict[str, Any]:
         """Return paginated obligations list plus coverage summary."""
-        store = self._load_raw()
+        with self._lock:
+            store = self._load_raw()
         all_items = store["items"]
         if status_filter:
             wanted = status_filter.strip().lower()
@@ -226,7 +276,8 @@ class ObligationLedger:
 
     def coverage_summary(self) -> dict[str, Any]:
         """Compute counts, percentage verified, and reconstruction readiness score."""
-        items = self._load_raw()["items"]
+        with self._lock:
+            items = self._load_raw()["items"]
         total = len(items)
         counts = {
             ObligationStatus.PENDING.value: 0,
@@ -239,18 +290,28 @@ class ObligationLedger:
             if st in counts:
                 counts[st] += 1
 
-        active_denominator = max(1, total - counts[ObligationStatus.SKIPPED.value])
+        active_total = total - counts[ObligationStatus.SKIPPED.value]
         verified = counts[ObligationStatus.VERIFIED.value]
         in_progress = counts[ObligationStatus.IN_PROGRESS.value]
 
-        verified_pct = round((verified / active_denominator) * 100.0, 2) if total > 0 else 0.0
-        weighted_score = round(((verified + 0.5 * in_progress) / active_denominator) * 100.0, 2) if total > 0 else 0.0
+        if total == 0:
+            verified_pct = 0.0
+            weighted_score = 0.0
+            ready_to_finalize = False
+        elif active_total == 0:
+            verified_pct = 100.0
+            weighted_score = 100.0
+            ready_to_finalize = True
+        else:
+            verified_pct = round((verified / active_total) * 100.0, 2)
+            weighted_score = round(((verified + 0.5 * in_progress) / active_total) * 100.0, 2)
+            ready_to_finalize = verified == active_total
 
         return {
             "total": total,
             "counts": counts,
             "verified_percent": verified_pct,
             "weighted_readiness_percent": weighted_score,
-            "ready_to_finalize": total > 0 and verified == active_denominator,
-                           }
-      
+            "ready_to_finalize": ready_to_finalize,
+                    }
+    

@@ -1,0 +1,47 @@
+name: NextGen-Anything CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Syntax compile check
+        run: python -m compileall -q nga tests sdk/python
+
+      - name: Run unit and integration tests
+        env:
+          PYTHONPATH: .
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: CLI smoke verification
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m nga.interfaces.cli doctor
+          python -m nga.interfaces.cli simulate "assert 6 * 7 == 42; print('CI_SIM_OK')"
+
+  rust-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test nga-fast-core crate
+        run: cargo test --manifest-path crates/nga-fast-core/Cargo.toml
+
+      - name: Test Rust SDK
+        run: cargo test --manifest-path sdk/rust/Cargo.toml
+        

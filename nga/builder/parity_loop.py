@@ -16,6 +16,7 @@ from nga.core.contracts import (
     ToolResponse,
 )
 from nga.core.ledger import ObligationLedger
+from nga.core.security import redact_secrets
 from nga.core.workspace import NgaWorkspace
 from nga.runtime.simulator import SimulationGate
 
@@ -30,7 +31,7 @@ _HEX_ADDR_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
 
 def _normalize_sandbox_text(text: str) -> str:
     """Strip per-run temp paths, sandbox IDs, and memory addresses for stable error matching."""
-    cleaned = str(text or "").strip()
+    cleaned = redact_secrets(str(text or "")).strip()
     if not cleaned:
         return ""
     cleaned = _SANDBOX_FILE_RE.sub('File "<sandbox>", line N', cleaned)
@@ -40,8 +41,8 @@ def _normalize_sandbox_text(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _compute_stall_signature(report: SimulationReport, label: str, attempt: int) -> str:
-    """Compute a deterministic failure signature invariant to temp directory names."""
+def _compute_stall_signature(report: SimulationReport, label: str) -> str:
+    """Compute a deterministic failure signature invariant to temp directory names or attempt numbers."""
     norm_stderr = _normalize_sandbox_text(report.stderr_preview)
     norm_checks = "|".join(_normalize_sandbox_text(c) for c in (report.checks_failed or []))
     if norm_stderr or norm_checks:
@@ -49,7 +50,8 @@ def _compute_stall_signature(report: SimulationReport, label: str, attempt: int)
         return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
     if report.error_signature:
         return str(report.error_signature)
-    return f"FAIL:{label}:{attempt}"
+    basis = f"{report.status.value}|silent_fail|{label}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass
@@ -58,6 +60,7 @@ class ParityLoopConfig:
 
     max_iterations: int = 5
     stall_threshold: int = 3
+    max_repairs_per_candidate: int = 2
     obligation_handle_or_id: int | str | None = None
 
 
@@ -84,6 +87,7 @@ class ParityVerificationLoop:
         cfg = config if config is not None else ParityLoopConfig()
         max_iter = max(1, min(20, int(cfg.max_iterations)))
         stall_limit = max(2, min(10, int(cfg.stall_threshold)))
+        max_repairs = max(0, min(5, int(cfg.max_repairs_per_candidate)))
 
         if not isinstance(candidates, list) or not candidates:
             return NgaError(
@@ -97,8 +101,19 @@ class ParityVerificationLoop:
         history: list[dict[str, Any]] = []
         last_error_sig: str = ""
         consecutive_same_errors: int = 0
+        total_runs = 0
 
         for idx, cand in enumerate(candidates[:max_iter], start=1):
+            if total_runs >= max_iter:
+                break
+            if not isinstance(cand, dict):
+                return NgaError(
+                    error_code=ErrorCode.INVALID_INPUT.value,
+                    module="nga.builder.parity_loop",
+                    message=f"Candidate at index {idx} must be a dictionary.",
+                    recoverable=True,
+                )
+
             label = str(cand.get("label", f"candidate_{idx}")).strip() or f"candidate_{idx}"
             code = str(cand.get("code", "") or "")
             smoke_code = str(cand.get("smoke_code", "") or "")
@@ -106,8 +121,9 @@ class ParityVerificationLoop:
             attempt = 0
             current_code = code
 
-            while True:
+            while total_runs < max_iter:
                 attempt += 1
+                total_runs += 1
                 report = self.simulator.simulate_crafted_python(
                     code=current_code,
                     smoke_assertions_code=smoke_code,
@@ -116,7 +132,7 @@ class ParityVerificationLoop:
                 if isinstance(report, NgaError):
                     return report
 
-                sig = _compute_stall_signature(report, label, attempt)
+                sig = _compute_stall_signature(report, label)
                 record = {
                     "iteration": idx,
                     "attempt": attempt,
@@ -127,16 +143,19 @@ class ParityVerificationLoop:
                     "duration_ms": report.duration_ms,
                     "checks_passed": report.checks_passed,
                     "checks_failed": report.checks_failed,
+                    "stderr_preview": report.stderr_preview[:400],
                 }
                 history.append(record)
 
                 if report.passed:
+                    ledger_updated = False
                     if self.ledger is not None and cfg.obligation_handle_or_id is not None:
-                        self.ledger.update_status(
+                        upd = self.ledger.update_status(
                             cfg.obligation_handle_or_id,
                             ObligationStatus.VERIFIED,
                             notes=f"Verified in sandbox ({report.run_id}, {report.duration_ms}ms).",
                         )
+                        ledger_updated = not isinstance(upd, NgaError)
                     if self.workspace is not None:
                         self.workspace.merkle.append(
                             "PARITY_SIMULATION_PASSED",
@@ -158,6 +177,7 @@ class ParityVerificationLoop:
                             "passed": True,
                             "winning_label": label,
                             "verified_code": current_code,
+                            "ledger_updated": ledger_updated,
                             "simulation": report.to_dict(),
                             "history": history,
                         },
@@ -199,9 +219,18 @@ class ParityVerificationLoop:
                         },
                     )
 
-                if callable(repair_fn) and attempt < max(3, stall_limit):
-                    repaired = repair_fn(current_code, report, attempt)
-                    if isinstance(repaired, str) and repaired.strip():
+                if callable(repair_fn) and attempt <= max_repairs and total_runs < max_iter:
+                    try:
+                        repaired = repair_fn(current_code, report, attempt)
+                    except Exception as exc:
+                        return NgaError(
+                            error_code=ErrorCode.INTERNAL_ERROR.value,
+                            module="nga.builder.parity_loop",
+                            message=redact_secrets(f"Repair callback raised error on '{label}': {exc}"),
+                            recoverable=True,
+                            details={"history": history},
+                        )
+                    if isinstance(repaired, str) and repaired.strip() and repaired.strip() != current_code.strip():
                         current_code = repaired
                         continue
                 break
@@ -217,5 +246,5 @@ class ParityVerificationLoop:
                 "last_attempt": last_sim,
                 "history": history,
             },
-)
-    
+    )
+                    

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -34,9 +36,6 @@ _DASHBOARD_HTML = """<!doctype html>
       --text: #e6edf3;
       --muted: #8b949e;
       --accent: #2f81f7;
-      --ok: #3fb950;
-      --warn: #d29922;
-      --err: #f85149;
     }
     * { box-sizing: border-box; }
     body {
@@ -101,7 +100,6 @@ _DASHBOARD_HTML = """<!doctype html>
       font-weight: 600;
       cursor: pointer;
     }
-    button:hover { opacity: 0.92; }
     .output-card { grid-column: 1 / -1; }
     pre {
       margin: 0;
@@ -172,9 +170,7 @@ print("SIM_OK:", x)</textarea>
   </main>
   <script>
     const outBox = document.getElementById("out-box");
-    function showJson(obj) {
-      outBox.textContent = JSON.stringify(obj, null, 2);
-    }
+    function showJson(obj) { outBox.textContent = JSON.stringify(obj, null, 2); }
     async function postJson(url, body) {
       const resp = await fetch(url, {
         method: "POST",
@@ -183,10 +179,7 @@ print("SIM_OK:", x)</textarea>
       });
       return await resp.json();
     }
-    async function runDoctor() {
-      const resp = await fetch("/api/doctor");
-      showJson(await resp.json());
-    }
+    async function runDoctor() { showJson(await (await fetch("/api/doctor")).json()); }
     async function runInspect() {
       const kind = document.getElementById("ins-kind").value;
       const target = document.getElementById("ins-path").value.trim();
@@ -202,14 +195,26 @@ print("SIM_OK:", x)</textarea>
       const kind = document.getElementById("brief-kind").value;
       showJson(await postJson("/api/brief", { label, kind }));
     }
-    async function loadLedger() {
-      const resp = await fetch("/api/ledger");
-      showJson(await resp.json());
-    }
+    async function loadLedger() { showJson(await (await fetch("/api/ledger")).json()); }
   </script>
 </body>
 </html>
 """
+
+
+def _resolve_allowed_origin(origin_header: str, extra_origins: set[str]) -> str | None:
+    """Allow local loopback origins, file:// embeds, or explicitly configured trusted origins."""
+    clean = (origin_header or "").strip()
+    if not clean:
+        return "http://127.0.0.1"
+    if clean == "null":
+        return "null"
+    if clean in extra_origins:
+        return clean
+    parsed = urlparse(clean)
+    if parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+        return clean
+    return None
 
 
 class NgaWebState:
@@ -230,10 +235,14 @@ def run_web_ui_server(
     project_name: str = "default",
     base_root: Path | None = None,
     max_requests: int | None = None,
+    api_token: str | None = None,
+    allowed_origins: list[str] | None = None,
 ) -> int:
-    """Start the local HTML5/Vanilla-JS dashboard and CORS-enabled JSON REST API."""
+    """Start the local HTML5/Vanilla-JS dashboard and hardened CORS JSON REST API."""
     bind_host = "127.0.0.1" if host in {"", "0.0.0.0", "localhost"} else str(host)
     bind_port = max(0, min(65535, int(port)))
+    configured_token = (api_token if api_token is not None else os.environ.get("NGA_API_TOKEN", "")).strip()
+    extra_origins = {o.strip() for o in (allowed_origins or []) if o and o.strip()}
     state = NgaWebState(project_name=project_name, base_root=base_root)
     counter = {"served": 0}
 
@@ -242,11 +251,24 @@ def run_web_ui_server(
             return
 
         def _set_cors(self) -> None:
-            self.send_header("Access-Control-Allow-Origin", "*")
+            origin = self.headers.get("Origin", "")
+            matched_origin = _resolve_allowed_origin(origin, extra_origins)
+            if matched_origin:
+                self.send_header("Access-Control-Allow-Origin", matched_origin)
+                self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-NGA-Token")
 
-        def _send_json(self, status_code: int, payload: dict[str, Any]) -> None:
+        def _is_authorized(self) -> bool:
+            if not configured_token:
+                return True
+            header_tok = self.headers.get("X-NGA-Token", "").strip()
+            auth_hdr = self.headers.get("Authorization", "").strip()
+            bearer_tok = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
+            candidate = header_tok or bearer_tok
+            return bool(candidate) and hmac.compare_digest(candidate, configured_token)
+
+        def _send_json(self, status_code: int, payload: dict[str, Any], count_request: bool = True) -> None:
             raw = json.dumps(payload, indent=2, default=str).encode("utf-8")
             self.send_response(status_code)
             self._set_cors()
@@ -254,7 +276,8 @@ def run_web_ui_server(
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
-            counter["served"] += 1
+            if count_request:
+                counter["served"] += 1
 
         def _send_html(self, html_str: str) -> None:
             raw = html_str.encode("utf-8")
@@ -299,8 +322,22 @@ def run_web_ui_server(
 
         def do_GET(self) -> None:
             path = urlparse(self.path).path or "/"
+            if path == "/favicon.ico":
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if path in {"/", "/index.html"}:
                 self._send_html(_DASHBOARD_HTML)
+                return
+            if not self._is_authorized():
+                err = NgaError(
+                    error_code=ErrorCode.INVALID_INPUT.value,
+                    module="nga.interfaces.web_ui",
+                    message="Unauthorized API request. Provide valid X-NGA-Token or Bearer token.",
+                    recoverable=True,
+                )
+                self._send_json(401, err.to_dict())
                 return
             if path == "/api/doctor":
                 res = run_environment_doctor(workspace_root=state.ws.root)
@@ -326,6 +363,15 @@ def run_web_ui_server(
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path or "/"
+            if not self._is_authorized():
+                err = NgaError(
+                    error_code=ErrorCode.INVALID_INPUT.value,
+                    module="nga.interfaces.web_ui",
+                    message="Unauthorized API request. Provide valid X-NGA-Token or Bearer token.",
+                    recoverable=True,
+                )
+                self._send_json(401, err.to_dict())
+                return
             body = self._read_json_body()
             if isinstance(body, NgaError):
                 self._send_json(400, body.to_dict())
@@ -420,4 +466,4 @@ def run_web_ui_server(
     finally:
         httpd.server_close()
     return 0
-                 
+  

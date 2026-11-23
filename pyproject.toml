@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nextgen-anything"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cross-OS Software Inspection, Sandbox Simulation, Mock Runtime & Autonomous Reconstruction Engine"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,3 +26,6 @@ nextgen-anything = "nga.interfaces.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nga*"]
+
+[tool.setuptools.package-data]
+"nga.interfaces.web_embed" = ["*.html", "*.js", "*.css"]

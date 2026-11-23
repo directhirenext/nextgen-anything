@@ -2,25 +2,39 @@
  * Zero-dependency ES Module SDK client for NextGen-Anything (`nga`) REST endpoints.
  */
 export class NgaJsClient {
-  constructor(baseUrl = "http://127.0.0.1:8765", timeoutMs = 15000) {
-    this.baseUrl = String(baseUrl || "http://127.0.0.1:8765").replace(/\/+$/, "");
+  constructor(baseUrl = "http://127.0.0.1:8765", timeoutMs = 15000, apiToken = "") {
+    this.baseUrl = String(baseUrl || "http://127.0.0.1:8765").trim().replace(/\/+$/, "");
     this.timeoutMs = Math.max(1000, Number(timeoutMs) || 15000);
+    this.apiToken = String(apiToken || "").trim();
+  }
+
+  _buildHeaders(hasBody) {
+    const headers = { Accept: "application/json" };
+    if (hasBody) {
+      headers["Content-Type"] = "application/json";
+    }
+    if (this.apiToken) {
+      headers["X-NGA-Token"] = this.apiToken;
+      headers["Authorization"] = `Bearer ${this.apiToken}`;
+    }
+    return headers;
   }
 
   async _request(method, path, payload = null) {
-    const cleanPath = path.startsWith("/") ? path : `/${path}`;
+    const cleanPath = String(path || "/").startsWith("/") ? String(path) : `/${path}`;
     const url = `${this.baseUrl}${cleanPath}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
+      const upperMethod = String(method || "GET").toUpperCase();
+      const hasBody = payload !== null && upperMethod !== "GET";
       const options = {
-        method: String(method || "GET").toUpperCase(),
-        headers: { Accept: "application/json" },
+        method: upperMethod,
+        headers: this._buildHeaders(hasBody),
         signal: controller.signal,
       };
-      if (payload !== null && options.method !== "GET") {
-        options.headers["Content-Type"] = "application/json";
+      if (hasBody) {
         options.body = JSON.stringify(payload);
       }
 
@@ -30,15 +44,18 @@ export class NgaJsClient {
         return JSON.parse(text);
       } catch {
         return {
-          ok: resp.ok,
+          ok: false,
           status: resp.status,
-          raw: text,
+          error_code: "NGA_INVALID_RESPONSE",
+          message: `Non-JSON response (HTTP ${resp.status})`,
+          raw: text.slice(0, 500),
         };
       }
     } catch (err) {
+      const isTimeout = Boolean(err && err.name === "AbortError");
       return {
         ok: false,
-        error_code: "NGA_NETWORK_UNREACHABLE",
+        error_code: isTimeout ? "NGA_TIMEOUT" : "NGA_NETWORK_UNREACHABLE",
         message: String(err && err.message ? err.message : err),
         recoverable: true,
         suggested_fix: "Start `nga ui --port 8765` and verify baseUrl.",
@@ -60,16 +77,80 @@ export class NgaJsClient {
     return this._request("POST", "/api/simulate", {
       code,
       label,
-      smoke_code: smokeCode,
+      smoke: smokeCode,
     });
   }
 
-  brief(label, kind = "web") {
-    return this._request("POST", "/api/brief", { label, kind });
+  synthesize(findings, appName = "reconstructed_app", outputDir = "synthesized_out", customPrompt = "") {
+    return this._request("POST", "/api/synthesize", {
+      app_name: appName,
+      findings,
+      output_dir: outputDir,
+      custom_prompt: customPrompt,
+    });
+  }
+
+  rebuild(kind, target, outputDir = "rebuilt_app", appName = "", customPrompt = "") {
+    return this._request("POST", "/api/rebuild", {
+      kind,
+      target,
+      output_dir: outputDir,
+      app_name: appName,
+      custom_prompt: customPrompt,
+    });
+  }
+
+  agentTurn(prompt, candidateCode = "", targetLabel = "js_sdk_agent") {
+    return this._request("POST", "/api/agent", {
+      prompt,
+      candidate_code: candidateCode,
+      target_label: targetLabel,
+    });
+  }
+
+  memoryStore(title, body, namespace = "agent_core", tags = []) {
+    return this._request("POST", "/api/memory", {
+      title,
+      body,
+      namespace,
+      tags,
+    });
+  }
+
+  memoryRetrieve(query, namespace = "", limit = 5) {
+    const qs = new URLSearchParams({ q: String(query || ""), limit: String(limit || 5) });
+    if (namespace) qs.set("namespace", String(namespace));
+    return this._request("GET", `/api/memory?${qs.toString()}`);
+  }
+
+  brief(label, kind = "web", customRequirements = "") {
+    return this._request("POST", "/api/brief", {
+      label,
+      kind,
+      custom_requirements: customRequirements,
+    });
   }
 
   ledgerList() {
     return this._request("GET", "/api/ledger");
   }
-    }
-          
+
+  ledgerAdd(obligationId, category = "endpoint", title = "", status = "pending") {
+    return this._request("POST", "/api/ledger", {
+      action: "add",
+      obligation_id: obligationId,
+      category,
+      title: title || obligationId,
+      status,
+    });
+  }
+
+  ledgerUpdate(obligationId, status) {
+    return this._request("POST", "/api/ledger", {
+      action: "update",
+      obligation_id: obligationId,
+      status,
+    });
+  }
+  }
+                           

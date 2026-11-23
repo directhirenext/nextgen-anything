@@ -1,8 +1,16 @@
 [package]
 name = "nga-fast-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Optional high-speed Rust scanner and indexer utilities for NextGen-Anything (nga)"
 license = "Apache-2.0"
+
+[lib]
+name = "nga_fast_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nga-fast-scan"
+path = "src/main.rs"
 
 [dependencies]

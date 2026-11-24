@@ -15,3 +15,4 @@ From the `crates/nga-fast-core` directory:
 
 ```bash
 cargo test
+```

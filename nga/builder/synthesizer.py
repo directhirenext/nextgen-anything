@@ -410,8 +410,7 @@ def _render_index_html(app_slug: str, primary_route: str, fields: list[str]) -> 
 </body>
 </html>
 """
-
-    def _render_generated_tests(app_slug: str, primary_route: str, fields: list[str]) -> str:
+def _render_generated_tests(app_slug: str, primary_route: str, fields: list[str]) -> str:
     sample_obj = {f: f"sample_{f}_1" for f in fields}
     updated_obj = {f: f"updated_{f}_1" for f in fields}
     sample_json_literal = json.dumps(json.dumps(sample_obj))
@@ -722,5 +721,5 @@ class AutonomousProjectSynthesizer:
                 "files": sorted(written_files.keys()),
                 "simulation_run_id": sim_rep.run_id,
             },
-                     )
+        )
         

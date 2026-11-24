@@ -411,10 +411,11 @@ def _render_index_html(app_slug: str, primary_route: str, fields: list[str]) -> 
 </html>
 """
 
-
-def _render_generated_tests(app_slug: str, primary_route: str, fields: list[str]) -> str:
+    def _render_generated_tests(app_slug: str, primary_route: str, fields: list[str]) -> str:
     sample_obj = {f: f"sample_{f}_1" for f in fields}
     updated_obj = {f: f"updated_{f}_1" for f in fields}
+    sample_json_literal = json.dumps(json.dumps(sample_obj))
+    updated_json_literal = json.dumps(json.dumps(updated_obj))
     return f'''"""Automated SQLite CRUD verification tests for {app_slug}."""
 
 from __future__ import annotations
@@ -449,7 +450,7 @@ class ReconstructedAppTests(unittest.TestCase):
                 with urlopen(f"{{base}}/health", timeout=5) as resp:
                     self.assertEqual(resp.status, 200)
 
-                create_payload = json.dumps({sample_obj!r}).encode("utf-8")
+                create_payload = {sample_json_literal}.encode("utf-8")
                 req_post = Request(f"{{base}}{{route}}", data=create_payload, headers={{"Content-Type": "application/json"}}, method="POST")
                 with urlopen(req_post, timeout=5) as resp:
                     self.assertEqual(resp.status, 201)
@@ -460,7 +461,7 @@ class ReconstructedAppTests(unittest.TestCase):
                     listed = json.loads(resp.read().decode("utf-8"))
                     self.assertGreaterEqual(listed["count"], 1)
 
-                upd_payload = json.dumps({updated_obj!r}).encode("utf-8")
+                upd_payload = {updated_json_literal}.encode("utf-8")
                 req_put = Request(f"{{base}}{{route}}/{{item_id}}", data=upd_payload, headers={{"Content-Type": "application/json"}}, method="PUT")
                 with urlopen(req_put, timeout=5) as resp:
                     self.assertEqual(resp.status, 200)
@@ -721,4 +722,5 @@ class AutonomousProjectSynthesizer:
                 "files": sorted(written_files.keys()),
                 "simulation_run_id": sim_rep.run_id,
             },
-)
+                     )
+        

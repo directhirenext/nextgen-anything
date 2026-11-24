@@ -38,14 +38,14 @@ class TelegramBotBridge:
         allowed_chat_ids: list[int | str] | None = None,
         agent: AutonomousIntentAgent | None = None,
         simulator: SimulationGate | None = None,
-        api_base: str = "[https://api.telegram.org](https://api.telegram.org)",
+        api_base: str = "https://api.telegram.org",
         timeout: float = 25.0,
         state_path: Path | str | None = None,
         require_allowlist: bool = False,
     ) -> None:
         raw_token = bot_token if bot_token is not None else os.environ.get("NGA_TELEGRAM_TOKEN", "")
         self.bot_token = str(raw_token or "").strip()
-        self.api_base = str(api_base or "[https://api.telegram.org](https://api.telegram.org)").rstrip("/")
+        self.api_base = str(api_base or "https://api.telegram.org").rstrip("/")
         self.timeout = max(5.0, float(timeout))
         self.agent = agent if agent is not None else AutonomousIntentAgent()
         self.simulator = simulator if simulator is not None else SimulationGate()
@@ -326,4 +326,4 @@ class TelegramBotBridge:
             self._save_persisted_offset()
 
         return processed
-                
+    

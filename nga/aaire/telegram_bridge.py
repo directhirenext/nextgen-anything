@@ -326,4 +326,4 @@ class TelegramBotBridge:
             self._save_persisted_offset()
 
         return processed
-    
+                    

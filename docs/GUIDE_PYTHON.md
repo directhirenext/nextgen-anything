@@ -25,9 +25,14 @@
   - `orchestrator.py`: Topological DAG task planner and runner (`WorkflowOrchestrator`).
   - `brief_gen.py`: Clean-room architectural blueprint and target stack generator.
   - `parity_loop.py`: Iterative simulation verification with 3-strike stall detection (`ParityVerificationLoop`).
+  - `synthesizer.py`: SQLite CRUD project synthesizer (`AutonomousProjectSynthesizer`).
+- **`nga.aaire`**:
+  - `intent_agent.py`: Autonomous intent classifier, planner, and sandbox-verified runner (`AutonomousIntentAgent`).
+  - `llm_engine.py`: Zero-dependency multi-provider LLM client (`UniversalLlmEngine`).
+  - `memory_vault.py`: SQLite FTS5 RAG memory vault (`AaireMemoryVault`).
+  - `telegram_bridge.py`: Telegram Bot API connector (`TelegramBotBridge`).
 - **`nga.interfaces`**:
   - `cli.py`: Command-line entrypoint (`nga`).
   - `mcp_server.py`: Line-delimited JSON-RPC MCP `stdio` server (`nga mcp`).
-  - `web_ui.py`: Local HTML5/Vanilla-JS dashboard and CORS JSON REST API (`nga ui`).
-  - `web_embed/`: Drop-in embeddable widget assets (`nga-widget.js`, `nga-widget.css`, `demo.html`).
-  - 
+  - `web_ui.py`: Local HTML5/Vanilla-JS dashboard and token-protected JSON REST API (`nga ui`).
+  - `web_embed/`: Drop-in embeddable widget assets (`nga-widget.js`, `nga-widget.css`, `console.html`).

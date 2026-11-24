@@ -36,3 +36,4 @@
   - `mcp_server.py`: Line-delimited JSON-RPC MCP `stdio` server (`nga mcp`).
   - `web_ui.py`: Local HTML5/Vanilla-JS dashboard and token-protected JSON REST API (`nga ui`).
   - `web_embed/`: Drop-in embeddable widget assets (`nga-widget.js`, `nga-widget.css`, `console.html`).
+  - 
